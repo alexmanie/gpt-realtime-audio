@@ -239,41 +239,51 @@ def build_ui() -> gr.Blocks:
         title="Multilanguage speech-to-speech",
         css=UI_CSS
     ) as demo:
-        gr.Markdown(
-            f"""
-            # 🎙️ Multi-language Speech-to-Speech Demo
-            Talking to **{AZURE_DEPLOYMENT}** on Azure AI Foundry.
+        with gr.Row():
+            with gr.Column():
+                gr.Markdown(
+                    f"""
+                    # 🎙️ Multi-language Speech-to-Speech Demo
+                    Talking to **{AZURE_DEPLOYMENT}** on Azure AI Foundry.
 
-            Click **Record**, allow microphone access, and start speaking.
-            Server-side VAD will detect when you stop and the model will reply with audio.
-            """
-        )
+                    Click **Record**, allow microphone access, and start speaking.
+                    Server-side VAD will detect when you stop and the model will reply with audio.
+                    """
+                )
 
-        with gr.Group(elem_id="voice-controls"):
-            voice_dropdown = gr.Dropdown(
-                label="Voice",
-                choices=AVAILABLE_VOICES,
-                value=get_selected_voice(),
-                info="Select the voice used for new realtime sessions.",
-            )
-            voice_status = gr.Markdown(
-                f"Current voice: **{get_selected_voice()}**. Stop/start recording to apply changes."
-            )
+                with gr.Group(elem_id="voice-controls"):
+                    voice_dropdown = gr.Dropdown(
+                        label="Voice",
+                        choices=AVAILABLE_VOICES,
+                        value=get_selected_voice(),
+                        info="Select the voice used for new realtime sessions.",
+                    )
+                    voice_status = gr.Markdown(
+                        f"Current voice: **{get_selected_voice()}**. Stop/start recording to apply changes."
+                    )
 
-        def on_voice_change(voice: str) -> str:
-            selected = set_selected_voice(voice)
-            return (
-                f"Current voice: **{selected}**. "
-                "Stop/start recording to apply changes."
-            )
+                def on_voice_change(voice: str) -> str:
+                    selected = set_selected_voice(voice)
+                    return (
+                        f"Current voice: **{selected}**. "
+                        "Stop/start recording to apply changes."
+                    )
 
-        voice_dropdown.change(
-            fn=on_voice_change,
-            inputs=voice_dropdown,
-            outputs=voice_status,
-        )
+                voice_dropdown.change(
+                    fn=on_voice_change,
+                    inputs=voice_dropdown,
+                    outputs=voice_status,
+                )
 
-        stream.ui.render()
+                stream.ui.render()
+
+            with gr.Column():
+                transcript_box = gr.Textbox(
+                    label="Transcript",
+                    placeholder="Text received from realtime model goes here.",
+                    interactive=False,
+                    lines=20,
+                )
 
     return demo
 
