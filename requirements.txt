@@ -1,5 +1,5 @@
 gradio>=5.0.0
-fastrtc>=0.0.20
+fastrtc>=0.0.34
 openai>=2.33.0
 python-dotenv>=1.2.2
 numpy>=1.26.0
