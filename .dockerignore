@@ -1,0 +1,12 @@
+.venv/
+.azure/
+.env
+.env.example
+.git/
+.gitignore
+.vscode/
+__pycache__/
+*.pyc
+.gradio/
+README.md
+next-steps.md

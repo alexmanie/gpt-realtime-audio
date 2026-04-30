@@ -1,0 +1,14 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
+
+name: gpt-realtime-audio
+metadata:
+    template: azd-init@1.24.1
+services:
+    gpt-realtime-audio:
+        project: .
+        host: containerapp
+        language: python
+resources:
+    gpt-realtime-audio:
+        type: host.containerapp
+        port: 80
