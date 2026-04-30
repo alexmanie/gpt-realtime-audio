@@ -9,7 +9,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# fastrtc declares gradio<6.0 in its metadata but works fine with gradio 6.x.
+# Install all other packages first, then fastrtc with --no-deps to bypass the
+# stale constraint, and finally fastrtc's non-gradio dependencies explicitly.
+RUN grep -v '^fastrtc' requirements.txt > /tmp/req_base.txt && \
+    pip install --no-cache-dir -r /tmp/req_base.txt && \
+    pip install --no-cache-dir --no-deps "fastrtc>=0.0.20" && \
+    pip install --no-cache-dir aioice>=0.10.1 aiortc librosa "numba>=0.60.0" audioop-lts standard-aifc standard-sunau
 
 COPY app.py .
 

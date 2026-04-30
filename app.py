@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import os
 
 import gradio as gr
@@ -62,6 +63,23 @@ AVAILABLE_VOICES = [
 ]
 DEFAULT_VOICE = "marin"
 SELECTED_VOICE = DEFAULT_VOICE
+
+# Pointer-events fix: the FastRTC waveContainer is absolutely positioned and
+# covers the whole component area. Setting pointer-events:none on it lets
+# clicks pass through to Gradio widgets rendered below it.
+UI_CSS = """
+gradio-webrtc-waveContainer,
+.gradio-webrtc-waveContainer {
+    pointer-events: none !important;
+}
+
+#voice-controls {
+    position: relative;
+    z-index: 20;
+    margin-top: 0;
+    margin-bottom: 0.75rem;
+}
+"""
 
 
 def get_selected_voice() -> str:
@@ -219,27 +237,13 @@ def build_ui() -> gr.Blocks:
         **stream_kwargs,
     )
 
-    # Pointer-events fix: the FastRTC waveContainer is absolutely positioned and
-    # covers the whole component area. Setting pointer-events:none on it lets
-    # clicks pass through to Gradio widgets rendered below it.
-    UI_CSS = """
-    gradio-webrtc-waveContainer,
-    .gradio-webrtc-waveContainer {
-        pointer-events: none !important;
-    }
+    # Gradio 5.x: css goes in Blocks(); Gradio 6.x: css goes in launch().
+    # Pass css here only for Gradio 5.x (where launch() doesn't accept it).
+    _blocks_kwargs: dict = {"title": "Multilanguage speech-to-speech"}
+    if "css" not in inspect.signature(gr.Blocks.launch).parameters:
+        _blocks_kwargs["css"] = UI_CSS
 
-    #voice-controls {
-        position: relative;
-        z-index: 20;
-        margin-top: 0;
-        margin-bottom: 0.75rem;
-    }
-    """
-
-    with gr.Blocks(
-        title="Multilanguage speech-to-speech",
-        css=UI_CSS
-    ) as demo:
+    with gr.Blocks(**_blocks_kwargs) as demo:
         with gr.Row():
             with gr.Column():
                 gr.Markdown(
@@ -291,8 +295,12 @@ def build_ui() -> gr.Blocks:
 
 if __name__ == "__main__":
     app = build_ui()
-    app.launch(
-        server_name=os.getenv("GRADIO_HOST", "127.0.0.1"),
-        server_port=int(os.getenv("GRADIO_PORT", "7860")),
-        show_error=True
-    )
+    _launch_kwargs: dict = {
+        "server_name": os.getenv("GRADIO_HOST", "127.0.0.1"),
+        "server_port": int(os.getenv("GRADIO_PORT", "7860")),
+        "show_error": True,
+    }
+    # Gradio 6+ moved css from Blocks() to launch(); keep compatible with both.
+    if "css" in inspect.signature(app.launch).parameters:
+        _launch_kwargs["css"] = UI_CSS
+    app.launch(**_launch_kwargs)
