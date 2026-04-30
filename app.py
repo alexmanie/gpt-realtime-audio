@@ -63,6 +63,23 @@ AVAILABLE_VOICES = [
 DEFAULT_VOICE = "marin"
 SELECTED_VOICE = DEFAULT_VOICE
 
+# Pointer-events fix: the FastRTC waveContainer is absolutely positioned and
+# covers the whole component area. Setting pointer-events:none on it lets
+# clicks pass through to Gradio widgets rendered below it.
+UI_CSS = """
+gradio-webrtc-waveContainer,
+.gradio-webrtc-waveContainer {
+    pointer-events: none !important;
+}
+
+#voice-controls {
+    position: relative;
+    z-index: 20;
+    margin-top: 0;
+    margin-bottom: 0.75rem;
+}
+"""
+
 
 def get_selected_voice() -> str:
     return SELECTED_VOICE
@@ -219,26 +236,8 @@ def build_ui() -> gr.Blocks:
         **stream_kwargs,
     )
 
-    # Pointer-events fix: the FastRTC waveContainer is absolutely positioned and
-    # covers the whole component area. Setting pointer-events:none on it lets
-    # clicks pass through to Gradio widgets rendered below it.
-    UI_CSS = """
-    gradio-webrtc-waveContainer,
-    .gradio-webrtc-waveContainer {
-        pointer-events: none !important;
-    }
-
-    #voice-controls {
-        position: relative;
-        z-index: 20;
-        margin-top: 0;
-        margin-bottom: 0.75rem;
-    }
-    """
-
     with gr.Blocks(
         title="Multilanguage speech-to-speech",
-        css=UI_CSS
     ) as demo:
         with gr.Row():
             with gr.Column():
@@ -294,5 +293,6 @@ if __name__ == "__main__":
     app.launch(
         server_name=os.getenv("GRADIO_HOST", "127.0.0.1"),
         server_port=int(os.getenv("GRADIO_PORT", "7860")),
-        show_error=True
+        show_error=True,
+        css=UI_CSS
     )
