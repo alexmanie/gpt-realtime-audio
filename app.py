@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import os
 
 import gradio as gr
@@ -236,9 +237,13 @@ def build_ui() -> gr.Blocks:
         **stream_kwargs,
     )
 
-    with gr.Blocks(
-        title="Multilanguage speech-to-speech",
-    ) as demo:
+    # Gradio 5.x: css goes in Blocks(); Gradio 6.x: css goes in launch().
+    # Pass css here only for Gradio 5.x (where launch() doesn't accept it).
+    _blocks_kwargs: dict = {"title": "Multilanguage speech-to-speech"}
+    if "css" not in inspect.signature(gr.Blocks.launch).parameters:
+        _blocks_kwargs["css"] = UI_CSS
+
+    with gr.Blocks(**_blocks_kwargs) as demo:
         with gr.Row():
             with gr.Column():
                 gr.Markdown(
@@ -290,9 +295,12 @@ def build_ui() -> gr.Blocks:
 
 if __name__ == "__main__":
     app = build_ui()
-    app.launch(
-        server_name=os.getenv("GRADIO_HOST", "127.0.0.1"),
-        server_port=int(os.getenv("GRADIO_PORT", "7860")),
-        show_error=True,
-        css=UI_CSS
-    )
+    _launch_kwargs: dict = {
+        "server_name": os.getenv("GRADIO_HOST", "127.0.0.1"),
+        "server_port": int(os.getenv("GRADIO_PORT", "7860")),
+        "show_error": True,
+    }
+    # Gradio 6+ moved css from Blocks() to launch(); keep compatible with both.
+    if "css" in inspect.signature(app.launch).parameters:
+        _launch_kwargs["css"] = UI_CSS
+    app.launch(**_launch_kwargs)
