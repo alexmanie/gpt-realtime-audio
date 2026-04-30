@@ -233,6 +233,12 @@ def build_ui() -> gr.Blocks:
         margin-top: 0;
         margin-bottom: 0.75rem;
     }
+
+    /* Contain the absolutely-positioned FastRTC wave canvas inside column 1 */
+    #stream-column {
+        position: relative !important;
+        overflow: hidden;
+    }
     """
 
     with gr.Blocks(
@@ -240,7 +246,7 @@ def build_ui() -> gr.Blocks:
         css=UI_CSS
     ) as demo:
         with gr.Row():
-            with gr.Column():
+            with gr.Column(elem_id="stream-column"):
                 gr.Markdown(
                     f"""
                     # 🎙️ Multi-language Speech-to-Speech Demo
