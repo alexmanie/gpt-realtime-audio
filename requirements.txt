@@ -1,6 +1,6 @@
 gradio>=6.13.0
 fastrtc>=0.0.20
-openai>=2.33.0
+openai>=3.42.1
 python-dotenv>=1.2.2
 numpy>=2.4.4
 websockets>=16.0
