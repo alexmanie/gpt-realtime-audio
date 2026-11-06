@@ -1,218 +1,127 @@
-# gpt-realtime Speech-to-Speech Demo
+# Azure Speech Assistant
 
-A minimal, single-file speech-to-speech demo using the **`gpt-realtime-1.5`** model on **Azure AI Foundry**.
-The UI is built with **Gradio** and real-time bidirectional audio is handled by **FastRTC** (WebRTC).
-No separate Flask/API layer — everything runs in one process.
+A Gradio conversation using **Azure AI Speech** for speech-to-text (STT) and
+**Azure OpenAI** for automatic generative replies, with on-demand
+**Azure AI Speech** text-to-speech (TTS).
 
 ## Architecture
 
-```
-Browser mic ──WebRTC──▶ Gradio + FastRTC ──WebSocket──▶ Azure Foundry gpt-realtime
-Browser speaker ◀─WebRTC── Gradio + FastRTC ◀──WebSocket── Azure Foundry gpt-realtime
+```text
+Browser microphone -> Gradio server -> Azure AI Speech STT endpoint
+Conversation dialog <- recognized text (user message) <-
+Transcript + conversation history -> Azure OpenAI -> assistant message
 ```
 
-- **Gradio** serves the web UI
-- **FastRTC** streams 24 kHz PCM16 audio frames over WebRTC
-- The handler forwards frames to the Foundry realtime WebSocket via `openai` SDK
-- Server-side VAD (voice activity detection) drives turn-taking
+Each recorded turn is uploaded to the Python app as a WAV file. The server
+sends it to the configured Speech endpoint, collects all recognized sentences,
+and appends the transcription as a user message in the conversation.
+It then automatically sends the conversation history and `SYSTEM_INSTRUCTIONS.md`
+to the configured Azure OpenAI chat deployment and appends its answer.
+The transcript is shown before the LLM call and remains visible if that call fails.
+Messages are isolated to the current Gradio session. Recognition errors are
+shown in the frontend without adding an empty or partial message.
+WebRTC and TURN credentials are not required.
+
+Browser recordings are converted to 16 kHz, mono, signed 16-bit PCM before
+being sent to Speech. Empty or silent recordings are rejected locally.
+If recognition returns no text, the frontend shows Azure's no-match reason,
+the selected language, and audio duration/level details. Play the recording
+back to verify the microphone captured speech and check the language selector.
 
 ## Prerequisites
 
 - Python 3.10+
-- An Azure AI Foundry deployment of `gpt-realtime` (e.g. `gpt-realtime-1.5`)
-- Azure CLI (`az`) for local sign-in, **or** a Managed Identity when running on Azure
-- A TURN provider for non-localhost WebRTC (Cloudflare TURN is used in this sample)
-- The runtime identity used by the app must have the **`Cognitive Services OpenAI User`** role on the Foundry resource
-
-## Azure Quick Checklist
-
-Before testing the deployed URL, verify all of these:
-
-1. The app is opened over `https://` (not `http://`).
-2. Container App env vars include `CLOUDFLARE_TURN_KEY_ID` and `CLOUDFLARE_TURN_KEY_API_TOKEN`.
-3. If `AZURE_CLIENT_ID` is set, that exact user-assigned identity has `Cognitive Services OpenAI User` on the Azure OpenAI resource.
-4. If `AZURE_CLIENT_ID` is not set, the system-assigned identity has `Cognitive Services OpenAI User`.
-5. After any role assignment changes, wait 1-3 minutes for RBAC propagation.
-6. The deployed code uses FastRTC parameters `turn_key_id` and `turn_key_api_token`.
-
-## Authentication
-
-This app uses **`DefaultAzureCredential`** — no API keys. Credentials are resolved in this order:
-
-1. Environment variables (`AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_CLIENT_SECRET`)
-2. Managed Identity (when deployed on Azure)
-3. Azure CLI (`az login`)
-4. Azure PowerShell, VS Code, etc.
-
-For local dev just run `az login` once.
+- An Azure AI Speech resource and its endpoint (or region)
+- An Azure OpenAI resource with a chat-capable deployment
+- Azure CLI (`az`) for local Entra ID sign-in, or a managed identity when hosted
 
 ## Setup
 
 ```powershell
-# 1. Sign in to Azure
 az login
-
-# 2. Create and activate a virtual environment
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-
-# 3. Install dependencies
 pip install -r requirements.txt
-
-# 4. Configure environment
 Copy-Item .env.example .env
-# edit .env and set AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_DEPLOYMENT
 ```
 
-## Run
+Edit `.env` and set:
+
+- `AZURE_OPENAI_ENDPOINT` and `AZURE_OPENAI_CHAT_DEPLOYMENT` to the OpenAI
+  resource endpoint and an existing chat deployment name. The name is displayed
+  in the UI; there is no implicit default model.
+- `AZURE_SPEECH_ENDPOINT` to the Speech resource's dedicated endpoint, for example
+  `https://your-speech-resource.cognitiveservices.azure.com/`. Do not use an
+  Azure OpenAI endpoint. Alternatively, leave it unset and configure
+  `AZURE_SPEECH_REGION` to use the regional Speech endpoint.
+- For Microsoft Entra ID, use the resource-specific custom endpoint and sign in
+  with `az login`. Alternatively, set `AZURE_SPEECH_KEY` to a key from the Speech
+  resource. Regional Entra authentication also needs `AZURE_SPEECH_RESOURCE_ID`.
+
+Run the app:
 
 ```powershell
 python app.py
 ```
 
-Open <http://127.0.0.1:7860> in a modern browser (Chrome/Edge/Firefox), allow microphone access, click **Record**, and start talking.
+Open <http://127.0.0.1:7860>, select the spoken language, record or upload a WAV
+clip. Stop recording, then press **Send**. The recognized text appears
+as a user message in **Conversation**, followed automatically by the LLM's reply.
+Once the reply arrives, the audio recorder clears automatically for the next
+message without clearing the conversation. If the request fails, the recording
+is kept.
+Repeat to add another message, or press
+**Clear conversation** to reset the dialog.
 
-Use the **Voice** dropdown in the UI to choose which voice the model should use.
+Below the conversation, select a multilingual voice and click **Speak last reply**
+to convert the latest assistant message to audio. **Spoken reply** starts playback
+automatically when audio is ready. If your browser blocks autoplay, press Play.
+TTS uses the same Speech resource and authentication as STT, and is
+never called automatically. The audio player clears when a new OpenAI reply
+arrives or the conversation is cleared.
+
+## Authentication and permissions
+
+Speech uses `AZURE_SPEECH_KEY` when configured; otherwise it uses the existing
+Azure CLI / `DefaultAzureCredential` chain. With a custom Speech endpoint, the
+SDK receives the credential directly. For regional Entra authentication, set the
+full `AZURE_SPEECH_RESOURCE_ID` copied from the Speech resource's Properties page;
+the SDK then receives `aad#<resource-id>#<access-token>`.
+The Speech resource must have a custom subdomain configured for Entra authentication.
+Do not pass a regional `https://<region>.api.cognitive.microsoft.com/` URL with
+`token_credential`: Azure rejects this combination with HTTP 400. Use your
+resource-specific custom endpoint, or a Speech resource key for that regional URL.
+
+For local development, sign in with `az login`. In Azure Container Apps, enable
+a system-assigned or user-assigned managed identity and grant it
+**Cognitive Services Speech User** on the Azure AI Speech resource.
+Also grant **Cognitive Services OpenAI User** on the Azure OpenAI resource.
+
+Set `AZURE_CLIENT_ID` only when the app should use a particular user-assigned
+managed identity. Keep resource keys and credentials in environment variables or
+a managed secret store; never commit them to source control.
 
 ## Configuration
 
-All settings live in `.env`:
-
 | Variable | Description | Default |
 |---|---|---|
-| `AZURE_OPENAI_ENDPOINT` | Foundry resource endpoint | *(required)* |
-| `AZURE_OPENAI_DEPLOYMENT` | Realtime deployment name | `gpt-realtime-1.5` |
-| `AZURE_OPENAI_API_VERSION` | API version | `2025-04-01-preview` |
-| `AZURE_CLIENT_ID` | Optional: force a specific user-assigned managed identity in Azure | *(unset)* |
-| `AZURE_TENANT_ID` | Optional tenant hint for credential resolution | *(unset)* |
-| `SYSTEM_INSTRUCTIONS` | System prompt | friendly assistant |
-| `CLOUDFLARE_TURN_KEY_ID` | Cloudflare TURN key id for WebRTC relay | *(required in Azure)* |
-| `CLOUDFLARE_TURN_KEY_API_TOKEN` | Cloudflare TURN API token for WebRTC relay | *(required in Azure)* |
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI resource endpoint | *(required)* |
+| `AZURE_OPENAI_CHAT_DEPLOYMENT` | Existing chat deployment name | *(required)* |
+| `AZURE_OPENAI_API_VERSION` | Azure OpenAI API version | `2025-04-01-preview` |
+| `AZURE_SPEECH_ENDPOINT` | Dedicated Speech endpoint; takes precedence over region | *(unset)* |
+| `AZURE_SPEECH_REGION` | Speech region when endpoint is unset | *(required without endpoint)* |
+| `AZURE_SPEECH_KEY` | Optional Speech resource key; omit to use Entra ID | *(unset)* |
+| `AZURE_SPEECH_RESOURCE_ID` | Full Speech ARM resource ID for regional Entra authentication | *(required without key or custom endpoint)* |
+| `AZURE_CLIENT_ID` | Optional user-assigned managed identity client ID | *(unset)* |
 | `GRADIO_HOST` | Bind address | `127.0.0.1` |
 | `GRADIO_PORT` | Port | `7860` |
 
-## Azure Deployment Notes
+The UI supports English (US), Spanish, French, German, Italian, Japanese, and
+Simplified Chinese for recognition.
 
-For Azure Container Apps, these are the key points that make this app work reliably:
+## Azure deployment
 
-1. TURN is required for browser-to-server audio relay.
-2. HTTPS must be used in production (secure context is required for mic + WebRTC).
-3. The identity actually used by `DefaultAzureCredential` must have OpenAI RBAC.
-
-### TURN setup (Cloudflare)
-
-Set both values in your Container App environment:
-
-- `CLOUDFLARE_TURN_KEY_ID`
-- `CLOUDFLARE_TURN_KEY_API_TOKEN`
-
-Without TURN, connections often fail in Azure with WebRTC initialization errors.
-
-### Managed Identity and RBAC
-
-This app authenticates to Azure OpenAI with Microsoft Entra ID.
-
-- If `AZURE_CLIENT_ID` is set, `DefaultAzureCredential` targets that user-assigned managed identity.
-- If `AZURE_CLIENT_ID` is not set, the platform may use system-assigned identity.
-
-Grant **`Cognitive Services OpenAI User`** on the Azure OpenAI resource to the identity that is actually selected.
-
-If your Container App has both system-assigned and user-assigned identities, verify which one is active and assign role accordingly.
-
-### Container App identity configuration patterns
-
-Use one of these two patterns and keep it explicit. Most `HTTP 401` websocket failures in this app come from identity mismatch (role assigned to one identity, but runtime uses the other).
-
-#### Pattern A: system-assigned identity only
-
-Use this when you do not need a reusable user-assigned identity.
-
-1. Enable only system-assigned identity on the Container App.
-2. Ensure `AZURE_CLIENT_ID` is not set in Container App environment variables.
-3. Assign `Cognitive Services OpenAI User` to the system-assigned identity on the Azure OpenAI resource scope.
-
-Example commands:
-
-```powershell
-# 1) Confirm identity mode and get system-assigned principalId
-az containerapp show -g <rg> -n <app> --query "identity" -o json
-
-# 2) Ensure AZURE_CLIENT_ID is absent for this mode
-az containerapp show -g <rg> -n <app> --query "properties.template.containers[0].env[].name" -o tsv
-
-# 3) Assign OpenAI role to system-assigned principal
-az role assignment create \
-	--assignee <systemAssignedPrincipalId> \
-	--role "Cognitive Services OpenAI User" \
-	--scope <azureOpenAiResourceId>
-```
-
-#### Pattern B: both system-assigned and user-assigned identities enabled
-
-Use this when you want a stable, reusable user-assigned identity across resources.
-
-1. Enable both identity types on the Container App.
-2. Set `AZURE_CLIENT_ID` to the user-assigned identity client id. This pins `DefaultAzureCredential` to that identity.
-3. Assign `Cognitive Services OpenAI User` to that user-assigned identity principal on the Azure OpenAI resource scope.
-
-Example commands:
-
-```powershell
-# 1) List user-assigned identities attached to the app
-az containerapp show -g <rg> -n <app> --query "identity.userAssignedIdentities" -o json
-
-# 2) Ensure AZURE_CLIENT_ID matches the intended user-assigned clientId
-az containerapp show -g <rg> -n <app> --query "properties.template.containers[0].env[?name=='AZURE_CLIENT_ID']" -o json
-
-# 3) Assign OpenAI role to user-assigned principal
-az role assignment create \
-	--assignee <userAssignedPrincipalId> \
-	--role "Cognitive Services OpenAI User" \
-	--scope <azureOpenAiResourceId>
-```
-
-Operational notes:
-
-- If `AZURE_CLIENT_ID` is set, the app will use that user-assigned identity and ignore system-assigned identity for token acquisition.
-- Wait 1-3 minutes after new role assignments for RBAC propagation.
-- If uncertain, temporarily assign role to both identities, validate traffic, then remove the unused assignment.
-
-## Troubleshooting (Known Errors)
-
-### 1) `Connection failed` during RTC startup
-
-Most common cause: missing TURN credentials in Azure.
-
-Check:
-
-- `CLOUDFLARE_TURN_KEY_ID` and `CLOUDFLARE_TURN_KEY_API_TOKEN` are present on the Container App.
-- Browser is using HTTPS URL.
-
-### 2) `server rejected WebSocket connection: HTTP 401`
-
-This is Azure OpenAI auth failure from the server-side websocket connect.
-
-Check:
-
-- The Container App managed identity has `Cognitive Services OpenAI User` on the target OpenAI account.
-- If `AZURE_CLIENT_ID` is set, make sure that specific user-assigned identity has the role.
-- Wait 1-3 minutes after role assignment for RBAC propagation.
-
-### 3) `get_cloudflare_turn_credentials() got an unexpected keyword argument 'key_id'`
-
-This indicates an API mismatch with installed FastRTC version.
-
-Use:
-
-- `turn_key_id`
-- `turn_key_api_token`
-
-instead of `key_id` / `api_token`.
-
-## Notes
-
-- The model uses 24 kHz mono PCM16 audio in both directions.
-- Turn detection is server-side VAD; adjust `threshold`/`silence_duration_ms` in `app.py` if needed.
-- For production, put the app behind HTTPS (WebRTC requires a secure context on non-localhost hosts).
-- Keep credentials server-side — the browser never sees a token; it only speaks WebRTC to the Python server.
-- For Azure Container Apps, configure TURN credentials and verify the correct managed identity has `Cognitive Services OpenAI User` on the Azure OpenAI resource.
+The included `azure.yaml` targets Azure Container Apps. Configure the environment
+variables above for the deployed app and grant its managed identity the required
+resource roles. For hosted microphone access, use the HTTPS URL provided by
+Container Apps.

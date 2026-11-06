@@ -1,306 +1,401 @@
-"""
-Speech-to-speech demo using Azure AI Foundry gpt-realtime model.
-
-Runs a Gradio UI with WebRTC (via FastRTC) for bidirectional low-latency audio.
-No extra Flask layer needed - Gradio handles UI + WebSocket bridge to Foundry.
-"""
+"""Speech-to-text conversation with automatic Azure OpenAI replies."""
 
 from __future__ import annotations
 
-import asyncio
-import base64
-import inspect
+import io
+import logging
+import math
 import os
+import threading
+import wave
+from collections.abc import Iterator
+from pathlib import Path
+from urllib.parse import urlparse
 
+import azure.cognitiveservices.speech as speechsdk
 import gradio as gr
 import numpy as np
-from azure.identity.aio import DefaultAzureCredential, AzureCliCredential, ChainedTokenCredential, get_bearer_token_provider
+from azure.identity import ChainedTokenCredential, AzureCliCredential, DefaultAzureCredential, get_bearer_token_provider
 from dotenv import load_dotenv
-from fastrtc import (
-    AsyncStreamHandler,
-    Stream,
-    get_cloudflare_turn_credentials_async,
-    get_cloudflare_turn_credentials,
-    wait_for_item,
-)
-from openai import AsyncAzureOpenAI
+from openai import AzureOpenAI
+from scipy.io import wavfile
+from scipy.signal import resample_poly
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+STT_SAMPLE_RATE = 16000
 COGNITIVE_SERVICES_SCOPE = "https://cognitiveservices.azure.com/.default"
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
+AZURE_OPENAI_CHAT_DEPLOYMENT = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "")
+AZURE_OPENAI_API_VERSION = os.getenv(
+    "AZURE_OPENAI_API_VERSION", "2025-04-01-preview"
+)
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "")
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "")
+AZURE_SPEECH_ENDPOINT = os.getenv("AZURE_SPEECH_ENDPOINT", "").strip()
+AZURE_SPEECH_RESOURCE_ID = os.getenv("AZURE_SPEECH_RESOURCE_ID", "").strip()
 
-AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
-AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-realtime-1.5")
-AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2025-04-01-preview")
-
-# Load system instructions from markdown file
-def _load_system_instructions() -> str:
-    try:
-        with open("SYSTEM_INSTRUCTIONS.md", "r") as f:
-            content = f.read()
-            # # Remove markdown title if present
-            # lines = content.strip().split("\n")
-            # if lines and lines[0].startswith("#"):
-            #     return "\n".join(lines[1:]).strip()
-            return content.strip()
-    except FileNotFoundError:
-        return "You are a helpful, friendly voice assistant. Keep responses concise and conversational."
-
-SYSTEM_INSTRUCTIONS = _load_system_instructions()
-
-SAMPLE_RATE = 24000  # gpt-realtime uses 24kHz PCM16
+LANGUAGES = {
+    "English (US)": "en-US",
+    "Slovenian (Slovenia)": "sl-SI",
+}
+LANGUAGE_NAMES = {
+    "en-US": "English",
+    "sl-SI": "Slovenian",
+}
 AVAILABLE_VOICES = [
-    "alloy",
-    "ash",
-    "ballad",
-    "coral",
-    "echo",
-    "sage",
-    "shimmer",
-    "verse",
-    "marin",
-    "cedar",
+    "en-US-EmmaMultilingualNeural",
+    "en-US-DerekMultilingualNeural",
+    "en-US-AndrewMultilingualNeural",
 ]
-DEFAULT_VOICE = "marin"
-SELECTED_VOICE = DEFAULT_VOICE
+DEFAULT_VOICE = AVAILABLE_VOICES[0]
 
-# Pointer-events fix: the FastRTC waveContainer is absolutely positioned and
-# covers the whole component area. Setting pointer-events:none on it lets
-# clicks pass through to Gradio widgets rendered below it.
-UI_CSS = """
-gradio-webrtc-waveContainer,
-.gradio-webrtc-waveContainer {
-    pointer-events: none !important;
-}
-
-#voice-controls {
-    position: relative;
-    z-index: 20;
-    margin-top: 0;
-    margin-bottom: 0.75rem;
-}
-"""
+SYSTEM_INSTRUCTIONS_PATH = Path(__file__).with_name("SYSTEM_INSTRUCTIONS.md")
+try:
+    SYSTEM_INSTRUCTIONS = SYSTEM_INSTRUCTIONS_PATH.read_text(encoding="utf-8").strip()
+except FileNotFoundError:
+    SYSTEM_INSTRUCTIONS = (
+        "You are a helpful, friendly voice assistant. "
+        "Keep responses concise and conversational."
+    )
 
 
-def get_selected_voice() -> str:
-    return SELECTED_VOICE
+def _speech_config() -> speechsdk.SpeechConfig:
+    if not AZURE_SPEECH_ENDPOINT and not AZURE_SPEECH_REGION:
+        raise gr.Error("Set AZURE_SPEECH_ENDPOINT or AZURE_SPEECH_REGION for Speech.")
 
-
-def set_selected_voice(voice: str) -> str:
-    global SELECTED_VOICE
-    if voice in AVAILABLE_VOICES:
-        SELECTED_VOICE = voice
-    return SELECTED_VOICE
-
-
-class RealtimeHandler(AsyncStreamHandler):
-    """Bridges FastRTC audio frames to Azure Foundry gpt-realtime WebSocket."""
-
-    def __init__(self) -> None:
-        super().__init__(
-            expected_layout="mono",
-            output_sample_rate=SAMPLE_RATE,
-            input_sample_rate=SAMPLE_RATE,
+    location = (
+        {"endpoint": AZURE_SPEECH_ENDPOINT}
+        if AZURE_SPEECH_ENDPOINT
+        else {"region": AZURE_SPEECH_REGION}
+    )
+    if AZURE_SPEECH_KEY:
+        return speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, **location)
+    if ".api.cognitive." in (urlparse(AZURE_SPEECH_ENDPOINT).hostname or ""):
+        raise gr.Error(
+            "The configured Speech endpoint is a regional API URL, which rejects "
+            "credential-based Entra authentication. Set AZURE_SPEECH_ENDPOINT to "
+            "your resource-specific custom endpoint "
+            "(https://<resource-name>.cognitiveservices.azure.com/), "
+            "or set AZURE_SPEECH_KEY for the regional endpoint."
         )
-        self.output_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
-        self.connection = None
-        self.client: AsyncAzureOpenAI | None = None
-        self.credential: ChainedTokenCredential | None = None
+    if not AZURE_SPEECH_ENDPOINT and not AZURE_SPEECH_RESOURCE_ID:
+        raise gr.Error(
+            "Set AZURE_SPEECH_ENDPOINT for Entra authentication, or set "
+            "AZURE_SPEECH_REGION and AZURE_SPEECH_RESOURCE_ID."
+        )
 
-    def copy(self) -> "RealtimeHandler":
-        return RealtimeHandler()
+    credential = ChainedTokenCredential(
+        AzureCliCredential(),
+        DefaultAzureCredential(),
+    )
 
-    async def start_up(self) -> None:
-        if not AZURE_ENDPOINT:
-            raise RuntimeError(
-                "Missing AZURE_OPENAI_ENDPOINT. Copy .env.example to .env and set it."
+    return speechsdk.SpeechConfig(
+            token_credential=credential, endpoint=AZURE_SPEECH_ENDPOINT
+        )
+    
+
+
+def transcribe_audio(audio_path: str, language: str) -> str:
+    if not audio_path or not Path(audio_path).is_file():
+        raise gr.Error("Record or upload an audio clip before sending.")
+
+    pcm, duration, audio_details = _prepare_stt_audio(audio_path)
+    speech_config = _speech_config()
+    speech_config.speech_recognition_language = language
+    audio_stream = speechsdk.audio.PushAudioInputStream(
+        stream_format=speechsdk.audio.AudioStreamFormat(
+            samples_per_second=STT_SAMPLE_RATE, bits_per_sample=16, channels=1
+        )
+    )
+    recognizer = speechsdk.SpeechRecognizer(
+        speech_config=speech_config,
+        audio_config=speechsdk.AudioConfig(stream=audio_stream),
+    )
+    finished = threading.Event()
+    segments: list[str] = []
+    errors: list[str] = []
+    no_matches: list[str] = []
+    cancellations: list[str] = []
+
+    def recognized(event) -> None:
+        if event.result.reason == speechsdk.ResultReason.RecognizedSpeech:
+            text = event.result.text.strip()
+            if text:
+                segments.append(text)
+        elif event.result.reason == speechsdk.ResultReason.NoMatch:
+            details = event.result.no_match_details
+            reason = str(details.reason) if details is not None else "NoMatch"
+            no_matches.append(reason)
+            logger.warning(
+                "Speech NoMatch: %s; %s; language=%s", reason, audio_details, language
             )
 
-        # Entra ID auth: try DefaultAzureCredential first (env vars, Managed Identity,
-        # VS Code, etc.), then fall back to AzureCliCredential for local `az login`.
-        # The signed-in principal needs the 'Cognitive Services OpenAI User' role
-        # on the Foundry resource.
-        self.credential = ChainedTokenCredential(
-            DefaultAzureCredential(),
-            AzureCliCredential(),
+    def canceled(event) -> None:
+        cancellations.append(str(event.reason))
+        if event.reason == speechsdk.CancellationReason.Error:
+            errors.append(event.error_details or str(event.reason))
+        finished.set()
+
+    recognizer.recognized.connect(recognized)
+    recognizer.canceled.connect(canceled)
+    recognizer.session_stopped.connect(lambda event: finished.set())
+    try:
+        recognizer.start_continuous_recognition_async().get()
+        try:
+            audio_stream.write(pcm)
+            audio_stream.close()
+            if not finished.wait(timeout=duration + 30):
+                raise gr.Error("Speech recognition timed out. Please try again.")
+        finally:
+            recognizer.stop_continuous_recognition_async().get()
+    finally:
+        audio_stream.close()
+    if errors:
+        raise gr.Error(f"Speech recognition failed: {errors[0]}")
+    if not segments:
+        reason = "; ".join(no_matches or cancellations) or (
+            "The Speech session stopped without recognition results; "
+            "check the endpoint and authentication configuration"
         )
+        raise gr.Error(
+            f"No speech was recognized: {reason}. {audio_details}. "
+            f"Recognition language: {language}. Play back the recording to check "
+            "that speech is audible, and select the language you spoke."
+        )
+    return " ".join(segments)
+
+
+def _prepare_stt_audio(audio_path: str) -> tuple[bytes, float, str]:
+    try:
+        sample_rate, samples = wavfile.read(audio_path)
+    except (ValueError, OSError) as exc:
+        raise gr.Error(f"Cannot read the recording as WAV audio: {exc}") from exc
+    if sample_rate <= 0 or samples.size == 0:
+        raise gr.Error("The recording is empty. Record a message before sending.")
+    channels = samples.shape[1] if samples.ndim == 2 else 1
+    source_dtype = str(samples.dtype)
+    if samples.dtype == np.uint8:
+        samples = (samples.astype(np.float64) - 128) / 128
+    elif np.issubdtype(samples.dtype, np.signedinteger):
+        samples = samples.astype(np.float64) / (2 ** (samples.dtype.itemsize * 8 - 1))
+    elif np.issubdtype(samples.dtype, np.floating):
+        samples = samples.astype(np.float64)
+    else:
+        raise gr.Error(f"Unsupported recording sample type: {source_dtype}.")
+    if not np.isfinite(samples).all():
+        raise gr.Error("The recording contains invalid audio samples. Record it again.")
+    if channels > 1:
+        samples = samples.mean(axis=1)
+    else:
+        samples = samples.reshape(-1)
+    if sample_rate != STT_SAMPLE_RATE:
+        divisor = math.gcd(sample_rate, STT_SAMPLE_RATE)
+        samples = resample_poly(
+            samples, STT_SAMPLE_RATE // divisor, sample_rate // divisor
+        )
+    pcm = np.rint(np.clip(samples, -1, 32767 / 32768) * 32768).astype("<i2")
+    duration = pcm.size / STT_SAMPLE_RATE
+    peak = float(np.max(np.abs(pcm.astype(np.float64)))) / 32768
+    rms = float(np.sqrt(np.mean((pcm.astype(np.float64) / 32768) ** 2)))
+    rms_db = f"{20 * math.log10(rms):.1f} dBFS" if rms else "-inf dBFS"
+    details = (
+        f"Recording: {duration:.2f}s, {sample_rate} Hz, {channels} channel(s), "
+        f"{source_dtype}; sent as 16000 Hz mono PCM16; "
+        f"peak {peak:.4f}, RMS {rms_db}"
+    )
+    logger.info("STT audio: %s", details)
+    if not pcm.any():
+        raise gr.Error(
+            f"The recording contains only silence. {details}. "
+            "Check microphone permissions and the selected input device."
+        )
+    return pcm.tobytes(), duration, details
+
+
+def send_to_stt(
+    audio_path: str | None,
+    language: str,
+    history: list[dict[str, str]] | None,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    transcript = transcribe_audio(audio_path or "", language)
+    updated_history = [
+        *(history or []),
+        {"role": "user", "content": transcript},
+    ]
+    return updated_history, updated_history
+
+
+def generate_reply(history: list[dict[str, str]], language: str) -> str:
+    if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_CHAT_DEPLOYMENT:
+        raise gr.Error(
+            "Set AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_CHAT_DEPLOYMENT to a "
+            "chat-capable Azure OpenAI deployment."
+        )
+
+    credential = ChainedTokenCredential(AzureCliCredential(), DefaultAzureCredential())
+    client: AzureOpenAI | None = None
+    try:
         token_provider = get_bearer_token_provider(
-            self.credential, COGNITIVE_SERVICES_SCOPE
+            credential,
+            COGNITIVE_SERVICES_SCOPE,
         )
-
-        self.client = AsyncAzureOpenAI(
-            azure_endpoint=AZURE_ENDPOINT,
+        client = AzureOpenAI(
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
             azure_ad_token_provider=token_provider,
-            api_version=AZURE_API_VERSION,
+            api_version=AZURE_OPENAI_API_VERSION,
         )
-        selected_voice = get_selected_voice()
+        messages = [
+            {
+                "role": "system",
+                "content": f"{SYSTEM_INSTRUCTIONS}\nRespond in the language "
+                f"{LANGUAGE_NAMES.get(language, language)} ({language}).",
+            },
+            *history,
+        ]
+        result = client.chat.completions.create(
+            model=AZURE_OPENAI_CHAT_DEPLOYMENT,
+            messages=messages,
+        )
+    finally:
+        if client is not None:
+            client.close()
+        credential.close()
 
-        async with self.client.beta.realtime.connect(model=AZURE_DEPLOYMENT) as conn:
-            self.connection = conn
-            await conn.session.update(
-                session={
-                    "modalities": ["audio", "text"],
-                    "instructions": SYSTEM_INSTRUCTIONS,
-                    "voice": selected_voice,
-                    "input_audio_format": "pcm16",
-                    "output_audio_format": "pcm16",
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": 0.5,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 500,
-                    },
-                }
-            )
+    reply = result.choices[0].message.content
+    if not reply or not reply.strip():
+        raise gr.Error("The chat deployment returned an empty response.")
+    return reply.strip()
 
-            async for event in conn:
-                etype = event.type
-                if etype == "response.audio.delta":
-                    pcm = base64.b64decode(event.delta)
-                    audio = np.frombuffer(pcm, dtype=np.int16).reshape(1, -1)
-                    await self.output_queue.put((SAMPLE_RATE, audio))
-                elif etype == "response.audio_transcript.delta":
-                    # Optional: could surface transcript to UI
-                    # Get transcript text from the delta
-                    transcript_delta = event.delta
-                    pass
-                elif etype == "error":
-                    print(f"[realtime error] {event}")
 
-    async def receive(self, frame: tuple[int, np.ndarray]) -> None:
-        if self.connection is None:
-            return
-        _sr, array = frame
-        array = array.squeeze()
-        if array.dtype != np.int16:
-            array = array.astype(np.int16)
-        audio_b64 = base64.b64encode(array.tobytes()).decode("utf-8")
-        await self.connection.input_audio_buffer.append(audio=audio_b64)
+def respond(
+    audio_path: str | None,
+    language: str,
+    history: list[dict[str, str]] | None,
+) -> Iterator[
+    tuple[list[dict[str, str]], list[dict[str, str]], dict[str, str] | None]
+]:
+    dialog, state = send_to_stt(audio_path, language, history)
+    yield dialog, state, gr.skip()
+    reply = generate_reply(state, language)
+    updated_history = [*state, {"role": "assistant", "content": reply}]
+    yield updated_history, updated_history, None
 
-    async def emit(self) -> tuple[int, np.ndarray] | None:
-        return await wait_for_item(self.output_queue)
 
-    async def shutdown(self) -> None:
-        if self.connection is not None:
-            try:
-                await self.connection.close()
-            except Exception:
-                pass
-            self.connection = None
-        if self.credential is not None:
-            try:
-                await self.credential.close()
-            except Exception:
-                pass
-            self.credential = None
+def synthesize_speech(text: str, voice: str) -> tuple[int, np.ndarray]:
+    speech_config = _speech_config()
+    speech_config.speech_synthesis_voice_name = voice
+    speech_config.set_speech_synthesis_output_format(
+        speechsdk.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm
+    )
+    synthesizer = speechsdk.SpeechSynthesizer(
+        speech_config=speech_config,
+        audio_config=None,
+    )
+    result = synthesizer.speak_text_async(text).get()
+
+    if result.reason == speechsdk.ResultReason.Canceled:
+        details = result.cancellation_details
+        message = details.error_details or str(details.reason)
+        raise gr.Error(f"Speech synthesis failed: {message}")
+    if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+        raise gr.Error("Speech synthesis did not return audio.")
+
+    with wave.open(io.BytesIO(result.audio_data), "rb") as audio_file:
+        if audio_file.getnchannels() != 1 or audio_file.getsampwidth() != 2:
+            raise gr.Error("Speech synthesis returned an unsupported audio format.")
+        sample_rate = audio_file.getframerate()
+        audio = np.frombuffer(
+            audio_file.readframes(audio_file.getnframes()),
+            dtype=np.int16,
+        ).copy()
+    return sample_rate, audio
+
+
+def speak_last_reply(
+    history: list[dict[str, str]] | None, voice: str
+) -> tuple[int, np.ndarray]:
+    for message in reversed(history or []):
+        if message["role"] == "assistant" and message["content"].strip():
+            return synthesize_speech(message["content"], voice)
+    raise gr.Error("There is no assistant reply to convert to speech yet.")
 
 
 def build_ui() -> gr.Blocks:
-    # WebRTC needs a TURN server when the browser and server are on different
-    # networks (i.e. anywhere except localhost). Azure Container Apps ingress
-    # does not forward the UDP traffic ICE negotiates, so without TURN the
-    # browser reports "Connection failed".
-    #
-    # If CLOUDFLARE_TURN_KEY_ID + CLOUDFLARE_TURN_KEY_API_TOKEN are set, use
-    # Cloudflare's TURN service (free tier: 10 GB/month). Otherwise fall back
-    # to STUN-only, which only works on localhost.
-    cf_key_id = os.getenv("CLOUDFLARE_TURN_KEY_ID")
-    cf_key_token = os.getenv("CLOUDFLARE_TURN_KEY_API_TOKEN")
+    with gr.Blocks(title="Speech and OpenAI conversation") as demo:
+        gr.Markdown(
+            f"""
+            # Speech and OpenAI Conversation
 
-    stream_kwargs: dict = {}
-    if cf_key_id and cf_key_token:
-        # Server-side creds fetcher (used by FastRTC's /webrtc/offer endpoint
-        # when the client connects) and a sync variant used at page load.
-        async def _rtc_creds():
-            return await get_cloudflare_turn_credentials_async(
-                turn_key_id=cf_key_id,
-                turn_key_api_token=cf_key_token,
-                ttl=3600,
-            )
-
-        stream_kwargs["rtc_configuration"] = _rtc_creds
-        stream_kwargs["server_rtc_configuration"] = get_cloudflare_turn_credentials(
-            turn_key_id=cf_key_id,
-            turn_key_api_token=cf_key_token,
-            ttl=3600,
+            Record your microphone, stop recording, then click **Send**.
+            The transcription appears as your message in the conversation.
+            Azure OpenAI replies automatically using deployment
+            **{AZURE_OPENAI_CHAT_DEPLOYMENT or "(not configured)"}**.
+            Use **Speak last reply** below the conversation to generate audio.
+            """
         )
 
-    stream = Stream(
-        handler=RealtimeHandler(),
-        modality="audio",
-        mode="send-receive",
-        ui_args={
-            "title": "",
-            "subtitle": "",
-            "full_screen": False,
-        },
-        **stream_kwargs,
-    )
-
-    # Gradio 5.x: css goes in Blocks(); Gradio 6.x: css goes in launch().
-    # Pass css here only for Gradio 5.x (where launch() doesn't accept it).
-    _blocks_kwargs: dict = {"title": "Multilanguage speech-to-speech"}
-    if "css" not in inspect.signature(gr.Blocks.launch).parameters:
-        _blocks_kwargs["css"] = UI_CSS
-
-    with gr.Blocks(**_blocks_kwargs) as demo:
         with gr.Row():
-            with gr.Column():
-                gr.Markdown(
-                    f"""
-                    # 🎙️ Multi-language Speech-to-Speech Demo
-                    Talking to **{AZURE_DEPLOYMENT}** on Azure AI Foundry.
+            with gr.Column(scale=1):
+                audio_input = gr.Audio(
+                    sources=["microphone", "upload"],
+                    type="filepath",
+                    format="wav",
+                    label="Your message",
+                )
+                language_dropdown = gr.Dropdown(
+                    choices=[(name, locale) for name, locale in LANGUAGES.items()],
+                    value="en-US",
+                    label="Spoken language",
+                )
+                send_button = gr.Button("Send", variant="primary")
+                clear_button = gr.Button("Clear conversation")
 
-                    Click **Record**, allow microphone access, and start speaking.
-                    Server-side VAD will detect when you stop and the model will reply with audio.
-                    """
+            with gr.Column(scale=2):
+                chatbot = gr.Chatbot(
+                    label="Conversation",
+                    height=420,
+                )
+                conversation_state = gr.State([])
+                voice_dropdown = gr.Dropdown(
+                    choices=AVAILABLE_VOICES,
+                    value=DEFAULT_VOICE,
+                    label="Reply voice",
+                )
+                speak_button = gr.Button("Speak last reply")
+                audio_output = gr.Audio(
+                    label="Spoken reply", interactive=False, format="wav", autoplay=True
                 )
 
-                with gr.Group(elem_id="voice-controls"):
-                    voice_dropdown = gr.Dropdown(
-                        label="Voice",
-                        choices=AVAILABLE_VOICES,
-                        value=get_selected_voice(),
-                        info="Select the voice used for new realtime sessions.",
-                    )
-                    voice_status = gr.Markdown(
-                        f"Current voice: **{get_selected_voice()}**. Stop/start recording to apply changes."
-                    )
-
-                def on_voice_change(voice: str) -> str:
-                    selected = set_selected_voice(voice)
-                    return (
-                        f"Current voice: **{selected}**. "
-                        "Stop/start recording to apply changes."
-                    )
-
-                voice_dropdown.change(
-                    fn=on_voice_change,
-                    inputs=voice_dropdown,
-                    outputs=voice_status,
-                )
-
-                stream.ui.render()
-
-            with gr.Column():
-                transcript_box = gr.Textbox(
-                    label="Transcript",
-                    placeholder="Text received from realtime model goes here.",
-                    interactive=False,
-                    lines=20,
-                )
+        send_button.click(
+            fn=respond,
+            inputs=[audio_input, language_dropdown, conversation_state],
+            outputs=[chatbot, conversation_state, audio_input],
+            concurrency_id="conversation",
+        ).success(
+            fn=lambda: None,
+            outputs=audio_output,
+            concurrency_id="conversation",
+        )
+        speak_button.click(
+            fn=speak_last_reply,
+            inputs=[conversation_state, voice_dropdown],
+            outputs=audio_output,
+            concurrency_id="conversation",
+        )
+        clear_button.click(
+            fn=lambda: ([], [], None, None),
+            outputs=[chatbot, conversation_state, audio_input, audio_output],
+            concurrency_id="conversation",
+        )
 
     return demo
 
 
 if __name__ == "__main__":
-    app = build_ui()
-    _launch_kwargs: dict = {
-        "server_name": os.getenv("GRADIO_HOST", "127.0.0.1"),
-        "server_port": int(os.getenv("GRADIO_PORT", "7860")),
-        "show_error": True,
-    }
-    # Gradio 6+ moved css from Blocks() to launch(); keep compatible with both.
-    if "css" in inspect.signature(app.launch).parameters:
-        _launch_kwargs["css"] = UI_CSS
-    app.launch(**_launch_kwargs)
+    build_ui().launch(
+        server_name=os.getenv("GRADIO_HOST", "127.0.0.1"),
+        server_port=int(os.getenv("GRADIO_PORT", "7860")),
+        show_error=True,
+    )
