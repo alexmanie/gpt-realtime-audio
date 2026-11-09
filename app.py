@@ -96,7 +96,6 @@ def _speech_config() -> speechsdk.SpeechConfig:
         )
     
 
-
 def transcribe_audio(audio_path: str, language: str) -> str:
     if not audio_path or not Path(audio_path).is_file():
         raise gr.Error("Record or upload an audio clip before sending.")
