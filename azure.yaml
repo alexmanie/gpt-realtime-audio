@@ -8,6 +8,8 @@ services:
         project: .
         host: containerapp
         language: python
+        docker:
+            remoteBuild: true
 resources:
     speech-chat-assistant:
         type: host.containerapp
