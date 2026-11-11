@@ -36,18 +36,29 @@ AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "")
 AZURE_SPEECH_ENDPOINT = os.getenv("AZURE_SPEECH_ENDPOINT", "").strip()
 AZURE_SPEECH_RESOURCE_ID = os.getenv("AZURE_SPEECH_RESOURCE_ID", "").strip()
 
+USE_CONTAINER = os.getenv("USE_CONTAINER", "false").lower() == "true"
+CONTAINER_TTS_ENDPOINT = os.getenv("CONTAINER_TTS_ENDPOINT", "").strip()
+CONTAINER_STT_EN_ENDPOINT = os.getenv("CONTAINER_STT_EN_ENDPOINT", "").strip()
+CONTAINER_STT_SL_ENDPOINT = os.getenv("CONTAINER_STT_SL_ENDPOINT", "").strip()
+
 LANGUAGES = {
-    "English (US)": "en-US",
     "Slovenian (Slovenia)": "sl-SI",
+    "English (US)": "en-US",
 }
 LANGUAGE_NAMES = {
-    "en-US": "English",
     "sl-SI": "Slovenian",
+    "en-US": "English",
 }
-AVAILABLE_VOICES = [
-    "de-DE-SeraphinaMultilingualNeural",
-    "en-US-AndrewMultilingualNeural",
-]
+
+if USE_CONTAINER:
+    AVAILABLE_VOICES = [
+        "de-DE-SeraphinaMultilingualNeural",
+    ]
+else:
+    AVAILABLE_VOICES = [
+        "de-DE-SeraphinaMultilingualNeural",
+        "en-US-AndrewMultilingualNeural",
+    ]
 DEFAULT_VOICE = AVAILABLE_VOICES[0]
 
 SYSTEM_INSTRUCTIONS_PATH = Path(__file__).with_name("SYSTEM_INSTRUCTIONS.md")
@@ -64,13 +75,14 @@ def _speech_config() -> speechsdk.SpeechConfig:
     if not AZURE_SPEECH_ENDPOINT and not AZURE_SPEECH_REGION:
         raise gr.Error("Set AZURE_SPEECH_ENDPOINT or AZURE_SPEECH_REGION for Speech.")
 
-    location = (
-        {"endpoint": AZURE_SPEECH_ENDPOINT}
-        if AZURE_SPEECH_ENDPOINT
-        else {"region": AZURE_SPEECH_REGION}
-    )
-    if AZURE_SPEECH_KEY:
-        return speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, **location)
+    # location = (
+    #     {"endpoint": AZURE_SPEECH_ENDPOINT}
+    #     if AZURE_SPEECH_ENDPOINT
+    #     else {"region": AZURE_SPEECH_REGION}
+    # )
+    # if AZURE_SPEECH_KEY:
+    #     return speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, **location)
+
     if ".api.cognitive." in (urlparse(AZURE_SPEECH_ENDPOINT).hostname or ""):
         raise gr.Error(
             "The configured Speech endpoint is a regional API URL, which rejects "
@@ -93,15 +105,51 @@ def _speech_config() -> speechsdk.SpeechConfig:
     return speechsdk.SpeechConfig(
             token_credential=credential, endpoint=AZURE_SPEECH_ENDPOINT
         )
-    
+
+def _speech_config_container_en_stt() -> speechsdk.SpeechConfig:
+    if not CONTAINER_STT_EN_ENDPOINT:
+        raise gr.Error("Set CONTAINER_STT_EN_ENDPOINT for Speech-to-text for English on container.")
+
+    return speechsdk.SpeechConfig(
+            host=CONTAINER_STT_EN_ENDPOINT
+        )
+
+
+def _speech_config_container_sl_stt() -> speechsdk.SpeechConfig:
+    if not CONTAINER_STT_SL_ENDPOINT:
+        raise gr.Error("Set CONTAINER_STT_SL_ENDPOINT for Speech-to-text for Slovenian on container.")
+
+    return speechsdk.SpeechConfig(
+            host=CONTAINER_STT_SL_ENDPOINT
+        )
+
+
+def _speech_config_container_tts() -> speechsdk.SpeechConfig:
+    if not CONTAINER_TTS_ENDPOINT:
+        raise gr.Error("Set CONTAINER_TTS_ENDPOINT for Text-to-speech on container.")
+
+    return speechsdk.SpeechConfig(host=CONTAINER_TTS_ENDPOINT)
+
+
 
 def transcribe_audio(audio_path: str, language: str) -> str:
     if not audio_path or not Path(audio_path).is_file():
         raise gr.Error("Record or upload an audio clip before sending.")
 
     pcm, duration, audio_details = _prepare_stt_audio(audio_path)
-    speech_config = _speech_config()
+    
+    if USE_CONTAINER:
+        if language == "en-US":
+            speech_config = _speech_config_container_en_stt()
+        elif language == "sl-SI":
+            speech_config = _speech_config_container_sl_stt()
+        else:
+            raise gr.Error(f"Unsupported language for container: {language}")
+    else:
+        speech_config = _speech_config()
+    
     speech_config.speech_recognition_language = language
+    
     audio_stream = speechsdk.audio.PushAudioInputStream(
         stream_format=speechsdk.audio.AudioStreamFormat(
             samples_per_second=STT_SAMPLE_RATE, bits_per_sample=16, channels=1
@@ -282,7 +330,12 @@ def respond(
 
 
 def synthesize_speech(text: str, voice: str) -> tuple[int, np.ndarray]:
-    speech_config = _speech_config()
+    
+    if USE_CONTAINER:
+        speech_config = _speech_config_container_tts()
+    else:
+        speech_config = _speech_config()
+
     speech_config.speech_synthesis_voice_name = voice
     speech_config.set_speech_synthesis_output_format(
         speechsdk.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm
@@ -324,12 +377,12 @@ def build_ui() -> gr.Blocks:
     with gr.Blocks(title="Speech and OpenAI conversation") as demo:
         gr.Markdown(
             f"""
-            # Speech and OpenAI Conversation
+            # Speech and OpenAI Conversation (*with containers: {str(USE_CONTAINER).lower()}*)
 
-            Record your microphone, stop recording, then click **Send**.
-            The transcription appears as your message in the conversation.
+            Record your microphone, stop recording, then click **Send**. 
+            The transcription appears as your message in the conversation.  
             Azure OpenAI replies automatically using deployment
-            **{AZURE_OPENAI_CHAT_DEPLOYMENT or "(not configured)"}**.
+            **{AZURE_OPENAI_CHAT_DEPLOYMENT or "(not configured)"}**.  
             Use **Speak last reply** below the conversation to generate audio.
             """
         )
@@ -344,7 +397,7 @@ def build_ui() -> gr.Blocks:
                 )
                 language_dropdown = gr.Dropdown(
                     choices=[(name, locale) for name, locale in LANGUAGES.items()],
-                    value="en-US",
+                    value="sl-SI",
                     label="Spoken language",
                 )
                 send_button = gr.Button("Send", variant="primary")
