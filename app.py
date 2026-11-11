@@ -45,8 +45,7 @@ LANGUAGE_NAMES = {
     "sl-SI": "Slovenian",
 }
 AVAILABLE_VOICES = [
-    "en-US-EmmaMultilingualNeural",
-    "en-US-DerekMultilingualNeural",
+    "de-DE-SeraphinaMultilingualNeural",
     "en-US-AndrewMultilingualNeural",
 ]
 DEFAULT_VOICE = AVAILABLE_VOICES[0]
