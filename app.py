@@ -37,7 +37,8 @@ AZURE_SPEECH_ENDPOINT = os.getenv("AZURE_SPEECH_ENDPOINT", "").strip()
 AZURE_SPEECH_RESOURCE_ID = os.getenv("AZURE_SPEECH_RESOURCE_ID", "").strip()
 
 USE_CONTAINER = os.getenv("USE_CONTAINER", "false").lower() == "true"
-CONTAINER_TTS_ENDPOINT = os.getenv("CONTAINER_TTS_ENDPOINT", "").strip()
+CONTAINER_TTS_SERAPHINA_ENDPOINT = os.getenv("CONTAINER_TTS_SERAPHINA_ENDPOINT", "").strip()
+CONTAINER_TTS_ANDREW_ENDPOINT = os.getenv("CONTAINER_TTS_ANDREW_ENDPOINT", "").strip()
 CONTAINER_STT_EN_ENDPOINT = os.getenv("CONTAINER_STT_EN_ENDPOINT", "").strip()
 CONTAINER_STT_SL_ENDPOINT = os.getenv("CONTAINER_STT_SL_ENDPOINT", "").strip()
 
@@ -49,16 +50,10 @@ LANGUAGE_NAMES = {
     "sl-SI": "Slovenian",
     "en-US": "English",
 }
-
-if USE_CONTAINER:
-    AVAILABLE_VOICES = [
-        "de-DE-SeraphinaMultilingualNeural",
-    ]
-else:
-    AVAILABLE_VOICES = [
-        "de-DE-SeraphinaMultilingualNeural",
-        "en-US-AndrewMultilingualNeural",
-    ]
+AVAILABLE_VOICES = [
+    "de-DE-SeraphinaMultilingualNeural",
+    "en-US-AndrewMultilingualNeural",
+]
 DEFAULT_VOICE = AVAILABLE_VOICES[0]
 
 SYSTEM_INSTRUCTIONS_PATH = Path(__file__).with_name("SYSTEM_INSTRUCTIONS.md")
@@ -124,11 +119,17 @@ def _speech_config_container_sl_stt() -> speechsdk.SpeechConfig:
         )
 
 
-def _speech_config_container_tts() -> speechsdk.SpeechConfig:
-    if not CONTAINER_TTS_ENDPOINT:
-        raise gr.Error("Set CONTAINER_TTS_ENDPOINT for Text-to-speech on container.")
-
-    return speechsdk.SpeechConfig(host=CONTAINER_TTS_ENDPOINT)
+def _speech_config_container_tts(voice: str) -> speechsdk.SpeechConfig:
+    if voice == "de-DE-SeraphinaMultilingualNeural":
+        if not CONTAINER_TTS_SERAPHINA_ENDPOINT:
+            raise gr.Error("Set CONTAINER_TTS_SERAPHINA_ENDPOINT for Text-to-speech on container.")
+        return speechsdk.SpeechConfig(host=CONTAINER_TTS_SERAPHINA_ENDPOINT)
+    elif voice == "en-US-AndrewMultilingualNeural":
+        if not CONTAINER_TTS_ANDREW_ENDPOINT:
+            raise gr.Error("Set CONTAINER_TTS_ANDREW_ENDPOINT for Text-to-speech on container.")
+        return speechsdk.SpeechConfig(host=CONTAINER_TTS_ANDREW_ENDPOINT)
+    else:
+        raise gr.Error(f"Unsupported voice for container: {voice}")
 
 
 
@@ -332,7 +333,7 @@ def respond(
 def synthesize_speech(text: str, voice: str) -> tuple[int, np.ndarray]:
     
     if USE_CONTAINER:
-        speech_config = _speech_config_container_tts()
+        speech_config = _speech_config_container_tts(voice)
     else:
         speech_config = _speech_config()
 
