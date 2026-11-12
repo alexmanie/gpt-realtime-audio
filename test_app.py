@@ -5,6 +5,7 @@ import wave
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError, URLError
 
 import gradio as gr
 import numpy as np
@@ -16,6 +17,99 @@ import app
 class Signal:
     def connect(self, callback):
         self.callback = callback
+
+
+class ContainerReadinessTests(unittest.TestCase):
+    def test_ready_requires_exact_ready_field_in_json_object(self):
+        cases = [
+            (b'{"ready":"ready","message":"API key is valid"}', True, "API key is valid"),
+            (b'{"ready":"starting","message":"Loading"}', False, "Loading"),
+            (b'{"ready":true}', False, 'Response does not contain'),
+            (b'{}', False, 'Response does not contain'),
+            (b'[]', False, "expected a JSON object"),
+            (b'not json', False, "Readiness check failed"),
+        ]
+        for body, expected, message in cases:
+            with self.subTest(body=body):
+                response = Mock()
+                response.__enter__ = Mock(return_value=io.BytesIO(body))
+                response.__exit__ = Mock(return_value=False)
+                with patch.object(app, "urlopen", return_value=response) as request:
+                    ready, detail = app._container_readiness("http://speech:5012/")
+                self.assertEqual(ready, expected)
+                self.assertIn(message, detail)
+                request.assert_called_once_with("http://speech:5012/ready", timeout=3)
+
+    def test_unavailable_or_unconfigured_container_is_not_ready(self):
+        with patch.object(app, "urlopen") as request:
+            self.assertEqual(
+                app._container_readiness(""), (False, "Endpoint not configured")
+            )
+            request.assert_not_called()
+        for error in (
+            HTTPError("http://speech:5012/ready", 503, "Unavailable", {}, None),
+            URLError("Connection refused"),
+            TimeoutError("Timed out"),
+        ):
+            with self.subTest(error=error):
+                with patch.object(app, "urlopen", side_effect=error):
+                    ready, detail = app._container_readiness("http://speech:5012")
+                self.assertFalse(ready)
+                self.assertIn("Readiness check failed", detail)
+
+    def test_indicators_show_each_service_and_escape_response_messages(self):
+        with (
+            patch.object(app, "CONTAINER_STT_EN_ENDPOINT", "http://en:5000"),
+            patch.object(app, "CONTAINER_STT_SL_ENDPOINT", "http://sl:5000"),
+            patch.object(app, "CONTAINER_TTS_SERAPHINA_ENDPOINT", "http://seraphina:5000"),
+            patch.object(app, "CONTAINER_TTS_ANDREW_ENDPOINT", "http://andrew:5000"),
+            patch.object(app, "_container_readiness", side_effect=[
+                (True, "Available"), (False, "<script>bad</script>"),
+                (False, "Loading"), (True, "Available"),
+            ]) as check,
+        ):
+            html = app.check_container_status()
+        self.assertEqual(
+            [call.args[0] for call in check.call_args_list],
+            ["http://en:5000", "http://sl:5000", "http://seraphina:5000", "http://andrew:5000"],
+        )
+        self.assertIn("STT English: Ready", html)
+        self.assertIn("STT Slovenian: Not ready", html)
+        self.assertIn("TTS Seraphina: Not ready", html)
+        self.assertIn("TTS Andrew: Ready", html)
+        self.assertEqual(html.count("background:#16a34a"), 2)
+        self.assertEqual(html.count("background:#dc2626"), 2)
+        self.assertEqual(html.count("background:#f0fdf4"), 2)
+        self.assertEqual(html.count("background:#fef2f2"), 2)
+        self.assertEqual(html.count("border-radius:6px"), 4)
+        self.assertNotIn("<script>", html)
+        self.assertIn('title="&lt;script&gt;bad&lt;/script&gt;"', html)
+
+    def test_ui_checks_on_load_and_every_30_seconds_without_conversation_queue(self):
+        with patch.object(app, "urlopen") as request:
+            ui = app.build_ui()
+            request.assert_not_called()
+        checks = [fn for fn in ui.fns.values() if fn.fn is app.check_container_status]
+        self.assertEqual(len(checks), 2)
+        self.assertIs(checks[0].outputs[0], checks[1].outputs[0])
+        self.assertIsInstance(checks[0].outputs[0], gr.HTML)
+        targets = [target for fn in checks for target in fn.targets]
+        self.assertIn((ui._id, "load"), targets)
+        timer_id = next(component_id for component_id, event in targets if event == "tick")
+        self.assertEqual(ui.blocks[timer_id].value, 30)
+        for fn in checks:
+            self.assertFalse(fn.queue)
+
+    def test_status_indicators_are_in_header_next_to_title(self):
+        ui = app.build_ui()
+        check = next(fn for fn in ui.fns.values() if fn.fn is app.check_container_status)
+        header = ui.children[0]
+        self.assertIsInstance(header, gr.Row)
+        self.assertEqual(
+            header.children[0].children[0].value,
+            "# Speech and OpenAI Conversation",
+        )
+        self.assertIs(header.children[1].children[0], check.outputs[0])
 
 
 class SpeechToTextTests(unittest.TestCase):

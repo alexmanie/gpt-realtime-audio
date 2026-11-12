@@ -81,6 +81,16 @@ Configure the container endpoints below before using container mode; missing
 endpoints are reported when the corresponding language or voice is used.
 The former `USE_CONTAINER` environment variable no longer controls the mode.
 
+The page header shows a compact, rounded green/red status badge for each STT/TTS
+container beside the title. Hover over a badge to see the readiness details.
+Status is checked when the page opens and automatically every 30 seconds while
+it remains open, regardless of the selected Speech mode. The Gradio server calls
+`<container-endpoint>/ready` with a 3-second timeout per container. Green means
+the HTTP request succeeded and the JSON contains `"ready": "ready"`; any other
+status, connection error, invalid response, or missing endpoint is shown in red
+with an explanation in the tooltip. These indicators monitor containers, not online Azure Speech
+or Azure OpenAI.
+
 Below the conversation, select a multilingual voice and click **Speak last reply**
 to convert the latest assistant message to audio. **Spoken reply** starts playback
 automatically when audio is ready. If your browser blocks autoplay, press Play.

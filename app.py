@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import math
 import os
 import threading
 import wave
 from collections.abc import Iterator
+from html import escape
 from pathlib import Path
 from urllib.parse import urlparse
+from urllib.request import urlopen
 
 import azure.cognitiveservices.speech as speechsdk
 import gradio as gr
@@ -377,12 +380,65 @@ def speak_last_reply(
     raise gr.Error("There is no assistant reply to convert to speech yet.")
 
 
+def _container_readiness(endpoint: str) -> tuple[bool, str]:
+    if not endpoint:
+        return False, "Endpoint not configured"
+    try:
+        with urlopen(f"{endpoint.rstrip('/')}/ready", timeout=3) as response:
+            payload = json.load(response)
+    except (OSError, ValueError) as exc:
+        return False, f"Readiness check failed: {exc}"
+    if not isinstance(payload, dict):
+        return False, "Invalid readiness response: expected a JSON object"
+    ready = payload.get("ready") == "ready"
+    message = str(payload.get("message") or (
+        "Service is ready" if ready else 'Response does not contain "ready": "ready"'
+    ))
+    return ready, message
+
+
+def check_container_status() -> str:
+    indicators = []
+    for label, endpoint in (
+        ("STT English", CONTAINER_STT_EN_ENDPOINT),
+        ("STT Slovenian", CONTAINER_STT_SL_ENDPOINT),
+        ("TTS Seraphina", CONTAINER_TTS_SERAPHINA_ENDPOINT),
+        ("TTS Andrew", CONTAINER_TTS_ANDREW_ENDPOINT),
+    ):
+        ready, message = _container_readiness(endpoint)
+        color = "#16a34a" if ready else "#dc2626"
+        background = "#f0fdf4" if ready else "#fef2f2"
+        border = "#bbf7d0" if ready else "#fecaca"
+        status = "Ready" if ready else "Not ready"
+        indicators.append(
+            f'<div title="{escape(message, quote=True)}" style="display:flex;'
+            f'align-items:center;gap:8px;padding:8px 12px;border:1px solid {border};'
+            f'border-radius:6px;background:{background};color:{color};'
+            'font-size:12px;line-height:20px;white-space:nowrap">'
+            f'<span aria-hidden="true" style="display:inline-block;width:6px;'
+            f'height:6px;flex-shrink:0;border-radius:50%;background:{color}"></span>'
+            f'<span>{escape(label)}: {status}</span></div>'
+        )
+    return (
+        '<div role="status" aria-label="Speech container status" '
+        'style="display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px">'
+        + "".join(indicators) + "</div>"
+    )
+
+
 def build_ui() -> gr.Blocks:
     with gr.Blocks(title="Speech and OpenAI conversation") as demo:
+        with gr.Row():
+            with gr.Column(scale=1, min_width=420):
+                gr.Markdown("# Speech and OpenAI Conversation")
+            with gr.Column(scale=2, min_width=320):
+                container_status = gr.HTML(
+                    '<div role="status" style="text-align:right">'
+                    'Checking Speech containers...</div>'
+                )
+        status_timer = gr.Timer(30)
         gr.Markdown(
             f"""
-            # Speech and OpenAI Conversation
-
             Record your microphone, stop recording, then click **Send**. 
             The transcription appears as your message in the conversation.  
             Azure OpenAI replies automatically using deployment
@@ -430,6 +486,18 @@ def build_ui() -> gr.Blocks:
                     label="Spoken reply", interactive=False, format="wav", autoplay=True
                 )
 
+        demo.load(
+            fn=check_container_status,
+            outputs=container_status,
+            queue=False,
+            show_progress="hidden",
+        )
+        status_timer.tick(
+            fn=check_container_status,
+            outputs=container_status,
+            queue=False,
+            show_progress="hidden",
+        )
         send_button.click(
             fn=respond,
             inputs=[audio_input, language_dropdown, conversation_state, use_container],
