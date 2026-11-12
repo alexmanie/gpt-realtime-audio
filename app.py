@@ -36,7 +36,6 @@ AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "")
 AZURE_SPEECH_ENDPOINT = os.getenv("AZURE_SPEECH_ENDPOINT", "").strip()
 AZURE_SPEECH_RESOURCE_ID = os.getenv("AZURE_SPEECH_RESOURCE_ID", "").strip()
 
-USE_CONTAINER = os.getenv("USE_CONTAINER", "false").lower() == "true"
 CONTAINER_TTS_SERAPHINA_ENDPOINT = os.getenv("CONTAINER_TTS_SERAPHINA_ENDPOINT", "").strip()
 CONTAINER_TTS_ANDREW_ENDPOINT = os.getenv("CONTAINER_TTS_ANDREW_ENDPOINT", "").strip()
 CONTAINER_STT_EN_ENDPOINT = os.getenv("CONTAINER_STT_EN_ENDPOINT", "").strip()
@@ -133,13 +132,13 @@ def _speech_config_container_tts(voice: str) -> speechsdk.SpeechConfig:
 
 
 
-def transcribe_audio(audio_path: str, language: str) -> str:
+def transcribe_audio(audio_path: str, language: str, use_container: bool = False) -> str:
     if not audio_path or not Path(audio_path).is_file():
         raise gr.Error("Record or upload an audio clip before sending.")
 
     pcm, duration, audio_details = _prepare_stt_audio(audio_path)
     
-    if USE_CONTAINER:
+    if use_container:
         if language == "en-US":
             speech_config = _speech_config_container_en_stt()
         elif language == "sl-SI":
@@ -265,8 +264,9 @@ def send_to_stt(
     audio_path: str | None,
     language: str,
     history: list[dict[str, str]] | None,
+    use_container: bool = False,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    transcript = transcribe_audio(audio_path or "", language)
+    transcript = transcribe_audio(audio_path or "", language, use_container)
     updated_history = [
         *(history or []),
         {"role": "user", "content": transcript},
@@ -320,19 +320,22 @@ def respond(
     audio_path: str | None,
     language: str,
     history: list[dict[str, str]] | None,
+    use_container: bool = False,
 ) -> Iterator[
     tuple[list[dict[str, str]], list[dict[str, str]], dict[str, str] | None]
 ]:
-    dialog, state = send_to_stt(audio_path, language, history)
+    dialog, state = send_to_stt(audio_path, language, history, use_container)
     yield dialog, state, gr.skip()
     reply = generate_reply(state, language)
     updated_history = [*state, {"role": "assistant", "content": reply}]
     yield updated_history, updated_history, None
 
 
-def synthesize_speech(text: str, voice: str) -> tuple[int, np.ndarray]:
+def synthesize_speech(
+    text: str, voice: str, use_container: bool = False
+) -> tuple[int, np.ndarray]:
     
-    if USE_CONTAINER:
+    if use_container:
         speech_config = _speech_config_container_tts(voice)
     else:
         speech_config = _speech_config()
@@ -366,11 +369,11 @@ def synthesize_speech(text: str, voice: str) -> tuple[int, np.ndarray]:
 
 
 def speak_last_reply(
-    history: list[dict[str, str]] | None, voice: str
+    history: list[dict[str, str]] | None, voice: str, use_container: bool = False
 ) -> tuple[int, np.ndarray]:
     for message in reversed(history or []):
         if message["role"] == "assistant" and message["content"].strip():
-            return synthesize_speech(message["content"], voice)
+            return synthesize_speech(message["content"], voice, use_container)
     raise gr.Error("There is no assistant reply to convert to speech yet.")
 
 
@@ -378,7 +381,7 @@ def build_ui() -> gr.Blocks:
     with gr.Blocks(title="Speech and OpenAI conversation") as demo:
         gr.Markdown(
             f"""
-            # Speech and OpenAI Conversation (*with containers: {str(USE_CONTAINER).lower()}*)
+            # Speech and OpenAI Conversation
 
             Record your microphone, stop recording, then click **Send**. 
             The transcription appears as your message in the conversation.  
@@ -390,6 +393,13 @@ def build_ui() -> gr.Blocks:
 
         with gr.Row():
             with gr.Column(scale=1):
+                use_container = gr.Checkbox(
+                    label="Use Speech containers",
+                    value=False,
+                    info=f"""
+                    Off: online Azure Speech.  
+                    On: configured Speech containers.""",
+                )
                 audio_input = gr.Audio(
                     sources=["microphone", "upload"],
                     type="filepath",
@@ -422,7 +432,7 @@ def build_ui() -> gr.Blocks:
 
         send_button.click(
             fn=respond,
-            inputs=[audio_input, language_dropdown, conversation_state],
+            inputs=[audio_input, language_dropdown, conversation_state, use_container],
             outputs=[chatbot, conversation_state, audio_input],
             concurrency_id="conversation",
         ).success(
@@ -432,7 +442,7 @@ def build_ui() -> gr.Blocks:
         )
         speak_button.click(
             fn=speak_last_reply,
-            inputs=[conversation_state, voice_dropdown],
+            inputs=[conversation_state, voice_dropdown, use_container],
             outputs=audio_output,
             concurrency_id="conversation",
         )

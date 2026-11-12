@@ -73,11 +73,19 @@ is kept.
 Repeat to add another message, or press
 **Clear conversation** to reset the dialog.
 
+Use the **Use Speech containers** checkbox to switch between online Azure Speech
+(off, the default) and the configured Speech containers (on). The selection is
+per browser session and applies to both transcription and speech synthesis.
+Switching modes does not change the conversation or the Azure OpenAI service.
+Configure the container endpoints below before using container mode; missing
+endpoints are reported when the corresponding language or voice is used.
+The former `USE_CONTAINER` environment variable no longer controls the mode.
+
 Below the conversation, select a multilingual voice and click **Speak last reply**
 to convert the latest assistant message to audio. **Spoken reply** starts playback
 automatically when audio is ready. If your browser blocks autoplay, press Play.
-TTS uses the same Speech resource and authentication as STT, and is
-never called automatically. The audio player clears when a new OpenAI reply
+TTS uses the selected Speech mode, and is never called automatically.
+The audio player clears when a new OpenAI reply
 arrives or the conversation is cleared.
 
 ## Authentication and permissions
@@ -112,12 +120,15 @@ a managed secret store; never commit them to source control.
 | `AZURE_SPEECH_REGION` | Speech region when endpoint is unset | *(required without endpoint)* |
 | `AZURE_SPEECH_KEY` | Optional Speech resource key; omit to use Entra ID | *(unset)* |
 | `AZURE_SPEECH_RESOURCE_ID` | Full Speech ARM resource ID for regional Entra authentication | *(required without key or custom endpoint)* |
+| `CONTAINER_STT_EN_ENDPOINT` | Speech container host for English recognition | *(unset)* |
+| `CONTAINER_STT_SL_ENDPOINT` | Speech container host for Slovenian recognition | *(unset)* |
+| `CONTAINER_TTS_SERAPHINA_ENDPOINT` | Speech container host for the Seraphina voice | *(unset)* |
+| `CONTAINER_TTS_ANDREW_ENDPOINT` | Speech container host for the Andrew voice | *(unset)* |
 | `AZURE_CLIENT_ID` | Optional user-assigned managed identity client ID | *(unset)* |
 | `GRADIO_HOST` | Bind address | `127.0.0.1` |
 | `GRADIO_PORT` | Port | `7860` |
 
-The UI supports English (US), Spanish, French, German, Italian, Japanese, and
-Simplified Chinese for recognition.
+The UI supports English (US) and Slovenian for recognition.
 
 ## Azure deployment
 
