@@ -107,61 +107,59 @@ class ContainerReadinessTests(unittest.TestCase):
         self.assertIsInstance(header, gr.Row)
         self.assertEqual(
             header.children[0].children[0].value,
-            "# Speech and OpenAI Conversation",
+            "# Speech to Text and Text to Speech",
         )
         self.assertIs(header.children[1].children[0], check.outputs[0])
 
 
 class SpeechToTextTests(unittest.TestCase):
-    def test_speak_last_reply_uses_latest_assistant_message(self):
-        history = [
-            {"role": "assistant", "content": "Older reply"},
-            {"role": "user", "content": "Question"},
-            {"role": "assistant", "content": "Latest reply"},
-            {"role": "user", "content": "Pending question"},
-        ]
-        audio = (24000, np.array([0, 100, -100], dtype=np.int16))
-        with patch.object(app, "synthesize_speech", return_value=audio) as tts:
-            result = app.speak_last_reply(history, app.DEFAULT_VOICE)
-        tts.assert_called_once_with("Latest reply", app.DEFAULT_VOICE, False)
-        self.assertIs(result, audio)
-        self.assertEqual(len(history), 4)
-
-    def test_speak_without_reply_reports_error(self):
-        for history in (None, [], [{"role": "user", "content": "Hello"}]):
-            with self.subTest(history=history):
-                with patch.object(app, "synthesize_speech") as tts:
+    def test_speak_without_text_reports_error_before_contacting_service(self):
+        for text in ("", " \n\t"):
+            with self.subTest(text=text):
+                with patch.object(app, "_speech_config") as config:
                     with self.assertRaises(gr.Error):
-                        app.speak_last_reply(history, app.DEFAULT_VOICE)
-                    tts.assert_not_called()
+                        app.synthesize_speech(text, app.DEFAULT_VOICE)
+                    config.assert_not_called()
 
-    def test_ui_routes_tts_from_session_history(self):
+    def test_ui_routes_tts_from_editable_transcript_without_conversation(self):
         ui = app.build_ui()
-        speak = next(fn for fn in ui.fns.values() if fn.fn is app.speak_last_reply)
-        send = next(fn for fn in ui.fns.values() if fn.fn is app.respond)
-        self.assertIs(speak.inputs[0], send.inputs[2])
+        speak = next(fn for fn in ui.fns.values() if fn.fn is app.synthesize_speech)
+        send = next(fn for fn in ui.fns.values() if fn.fn is app.send_to_stt)
+        self.assertIs(speak.inputs[0], send.outputs[0])
+        self.assertIsInstance(speak.inputs[0], gr.Textbox)
+        self.assertTrue(speak.inputs[0].interactive)
+        self.assertGreater(speak.inputs[0].lines, 1)
+        self.assertFalse(any(isinstance(block, (gr.Chatbot, gr.State)) for block in ui.blocks.values()))
         self.assertIsInstance(speak.outputs[0], gr.Audio)
         self.assertTrue(speak.outputs[0].autoplay)
         self.assertEqual(speak.inputs[1].value, app.DEFAULT_VOICE)
-        self.assertIs(speak.inputs[2], send.inputs[3])
-        self.assertIsInstance(send.inputs[3], gr.Checkbox)
-        self.assertFalse(send.inputs[3].value)
+        self.assertIs(speak.inputs[2], send.inputs[2])
+        self.assertIsInstance(send.inputs[2], gr.Checkbox)
+        self.assertIs(send.outputs[2], speak.outputs[0])
 
-    def test_selected_mode_is_forwarded_to_stt_and_tts(self):
+    def test_clear_resets_text_and_both_audio_components(self):
+        ui = app.build_ui()
+        clear = next(
+            fn for fn in ui.fns.values()
+            if any(getattr(ui.blocks.get(target), "value", None) == "Clear" for target, _ in fn.targets)
+        )
+        send = next(fn for fn in ui.fns.values() if fn.fn is app.send_to_stt)
+        self.assertEqual(clear.outputs, send.outputs)
+        self.assertEqual(clear.fn(), ("", None, None))
+
+    def test_selected_mode_is_forwarded_to_stt_without_automatic_tts(self):
         for use_container in (False, True):
             with self.subTest(use_container=use_container):
                 with (
                     patch.object(app, "transcribe_audio", return_value="Hello") as stt,
-                    patch.object(app, "generate_reply", return_value="Hi"),
-                    patch.object(app, "synthesize_speech", return_value="audio") as tts,
+                    patch.object(app, "synthesize_speech") as tts,
                 ):
-                    updates = list(app.respond("recording.wav", "en-US", [], use_container))
                     self.assertEqual(
-                        app.speak_last_reply(updates[-1][1], app.DEFAULT_VOICE, use_container),
-                        "audio",
+                        app.send_to_stt("recording.wav", "en-US", use_container),
+                        ("Hello", None, None),
                     )
                 stt.assert_called_once_with("recording.wav", "en-US", use_container)
-                tts.assert_called_once_with("Hi", app.DEFAULT_VOICE, use_container)
+                tts.assert_not_called()
 
     def test_transcription_selects_mode_and_language_endpoint(self):
         cases = [
@@ -224,11 +222,90 @@ class SpeechToTextTests(unittest.TestCase):
                         rate, samples = app.synthesize_speech("Hello", voice, use_container)
                     self.assertEqual(rate, 24000)
                     self.assertEqual(samples.tolist(), [0])
+                    synthesizer.speak_text_async.assert_called_once_with("Hello")
                     self.assertEqual(online.call_count, int(not use_container))
                     if use_container:
                         container.assert_called_once_with(voice)
                     else:
                         container.assert_not_called()
+
+    def test_long_text_is_preserved_in_bounded_chunks(self):
+        for text in (
+            "## Heading\n\n" + ("A sentence about audio sampling. " * 120),
+            "a" * 2501,
+            (" " * 1200) + "Text after leading whitespace.",
+        ):
+            with self.subTest(text=text[:30]):
+                chunks = app._split_tts_text(text)
+                self.assertEqual("".join(chunks), text)
+                self.assertTrue(all(0 < len(chunk) <= 1000 for chunk in chunks))
+
+    def test_long_synthesis_joins_pcm_in_order_and_rejects_partial_results(self):
+        text = "Sentence about audio. " * 130
+        chunks = app._split_tts_text(text)
+        results = []
+        for index in range(len(chunks)):
+            wav = io.BytesIO()
+            with wave.open(wav, "wb") as audio:
+                audio.setnchannels(1)
+                audio.setsampwidth(2)
+                audio.setframerate(24000)
+                audio.writeframes(np.array([index, -index], dtype="<i2").tobytes())
+            results.append(SimpleNamespace(
+                reason=app.speechsdk.ResultReason.SynthesizingAudioCompleted,
+                audio_data=wav.getvalue(),
+            ))
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                responses = list(results)
+                if fail:
+                    responses[1] = SimpleNamespace(
+                        reason=app.speechsdk.ResultReason.Canceled,
+                        cancellation_details=SimpleNamespace(
+                            error_details="Internal server error", reason="Error"
+                        ),
+                    )
+                synthesizer = Mock()
+                synthesizer.speak_text_async.return_value.get.side_effect = responses
+                with (
+                    patch.object(app, "_speech_config_container_tts", return_value=Mock()),
+                    patch.object(app.speechsdk, "SpeechSynthesizer", return_value=synthesizer),
+                ):
+                    if fail:
+                        with self.assertRaisesRegex(gr.Error, "part 2/.*Internal server error"):
+                            app.synthesize_speech(text, app.DEFAULT_VOICE, True)
+                        self.assertEqual(synthesizer.speak_text_async.call_count, 2)
+                    else:
+                        rate, samples = app.synthesize_speech(text, app.DEFAULT_VOICE, True)
+                        self.assertEqual(rate, 24000)
+                        self.assertEqual(
+                            samples.tolist(),
+                            [value for index in range(len(chunks)) for value in (index, -index)],
+                        )
+                        sent = [call.args[0] for call in synthesizer.speak_text_async.call_args_list]
+                        self.assertEqual("".join(sent), text)
+                        self.assertTrue(all(len(chunk) <= 1000 for chunk in sent))
+
+    def test_synthesis_rejects_empty_or_inconsistent_audio(self):
+        for rate, frames in ((24000, b""), (16000, b"\x00\x00")):
+            with self.subTest(rate=rate, frames=frames):
+                wav = io.BytesIO()
+                with wave.open(wav, "wb") as audio:
+                    audio.setnchannels(1)
+                    audio.setsampwidth(2)
+                    audio.setframerate(rate)
+                    audio.writeframes(frames)
+                synthesizer = Mock()
+                synthesizer.speak_text_async.return_value.get.return_value = SimpleNamespace(
+                    reason=app.speechsdk.ResultReason.SynthesizingAudioCompleted,
+                    audio_data=wav.getvalue(),
+                )
+                with (
+                    patch.object(app, "_speech_config", return_value=Mock()),
+                    patch.object(app.speechsdk, "SpeechSynthesizer", return_value=synthesizer),
+                ):
+                    with self.assertRaises(gr.Error):
+                        app.synthesize_speech("Hello", app.DEFAULT_VOICE)
 
     def test_missing_container_endpoint_reports_error_without_online_fallback(self):
         with (
@@ -268,42 +345,6 @@ class SpeechToTextTests(unittest.TestCase):
                     configure()
                     config.assert_called_with(host=host)
 
-    def test_respond_shows_transcript_before_calling_llm(self):
-        history = [{"role": "user", "content": "Previous message"}]
-        with (
-            patch.object(app, "transcribe_audio", return_value="Hello"),
-            patch.object(app, "generate_reply", return_value="Hi!") as chat,
-            patch.object(app, "synthesize_speech") as tts,
-        ):
-            updates = app.respond("recording.wav", "en-US", history)
-            first, state, audio_update = next(updates)
-            self.assertEqual(audio_update, gr.skip())
-            self.assertEqual(first[-1], {"role": "user", "content": "Hello"})
-            chat.assert_not_called()
-            final, final_state, audio_update = next(updates)
-            self.assertIsNone(audio_update)
-            chat.assert_called_once_with(state, "en-US")
-            self.assertEqual(final[-1], {"role": "assistant", "content": "Hi!"})
-            self.assertEqual(final, final_state)
-            self.assertEqual(len(first), 2)
-            self.assertEqual(len(history), 1)
-            tts.assert_not_called()
-            with self.assertRaises(StopIteration):
-                next(updates)
-
-    def test_llm_failure_does_not_remove_transcript(self):
-        with (
-            patch.object(app, "transcribe_audio", return_value="Hello"),
-            patch.object(app, "generate_reply", side_effect=gr.Error("LLM failed")),
-        ):
-            updates = app.respond("recording.wav", "en-US", [])
-            dialog, state, audio_update = next(updates)
-            self.assertEqual(audio_update, gr.skip())
-            with self.assertRaises(gr.Error):
-                next(updates)
-            self.assertEqual(dialog, [{"role": "user", "content": "Hello"}])
-            self.assertEqual(dialog, state)
-
     def test_regional_endpoint_with_entra_reports_auth_configuration_error(self):
         with (
             patch.object(
@@ -333,39 +374,14 @@ class SpeechToTextTests(unittest.TestCase):
             token_credential=credential, endpoint="https://speech.example.com/"
         )
 
-    def test_send_appends_user_message_without_chat_or_tts(self):
-        history = [{"role": "user", "content": "Previous message"}]
-        with (
-            patch.object(app, "transcribe_audio", return_value="Hello world") as stt,
-            patch.object(app, "generate_reply") as chat,
-            patch.object(app, "synthesize_speech") as tts,
-        ):
-            dialog, state = app.send_to_stt("recording.wav", "en-US", history)
-        stt.assert_called_once_with("recording.wav", "en-US", False)
-        self.assertEqual(dialog[-1], {"role": "user", "content": "Hello world"})
-        self.assertEqual(dialog, state)
-        self.assertEqual(len(history), 1)
-        chat.assert_not_called()
-        tts.assert_not_called()
-
-    def test_failed_recognition_preserves_history(self):
-        history = [{"role": "user", "content": "Previous message"}]
+    def test_failed_recognition_surfaces_without_returning_clear_updates(self):
         with patch.object(app, "transcribe_audio", side_effect=gr.Error("No speech")):
-            with self.assertRaises(gr.Error):
-                app.send_to_stt("recording.wav", "en-US", history)
-        self.assertEqual(history, [{"role": "user", "content": "Previous message"}])
+            with self.assertRaisesRegex(gr.Error, "No speech"):
+                app.send_to_stt("recording.wav", "en-US")
 
     def test_missing_recording_is_reported(self):
         with self.assertRaises(gr.Error):
             app.transcribe_audio("", "en-US")
-
-    def test_session_histories_are_independent(self):
-        with patch.object(app, "transcribe_audio", return_value="Hello"):
-            first, _ = app.send_to_stt("recording.wav", "en-US", [])
-            second, _ = app.send_to_stt("recording.wav", "en-US", [])
-        self.assertEqual(len(first), 1)
-        self.assertEqual(len(second), 1)
-        self.assertIsNot(first, second)
 
     def test_explicit_endpoint_used_for_key_auth(self):
         with (
@@ -503,14 +519,14 @@ class SpeechToTextTests(unittest.TestCase):
                 app.transcribe_audio(str(path), "en-US")
             self.assertIn("Cannot read", str(error.exception))
 
-    def test_ui_routes_send_to_stt_and_llm(self):
+    def test_ui_routes_send_to_stt_and_clears_recording_on_success(self):
         ui = app.build_ui()
-        send = next(fn for fn in ui.fns.values() if fn.fn is app.respond)
-        self.assertEqual(len(send.inputs), 4)
+        send = next(fn for fn in ui.fns.values() if fn.fn is app.send_to_stt)
+        self.assertEqual(len(send.inputs), 3)
         self.assertEqual(len(send.outputs), 3)
-        self.assertIsInstance(send.outputs[0], gr.Chatbot)
+        self.assertIsInstance(send.outputs[0], gr.Textbox)
         audio = send.inputs[0]
-        self.assertIs(send.outputs[2], audio)
+        self.assertIs(send.outputs[1], audio)
         self.assertIn("microphone", audio.sources)
         self.assertEqual(audio.format, "wav")
 

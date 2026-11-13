@@ -1,5 +1,4 @@
 gradio>=6.13.0
-openai>=2.33.0
 python-dotenv>=1.2.2
 azure-identity>=1.19.0
 azure-cognitiveservices-speech>=1.43.0

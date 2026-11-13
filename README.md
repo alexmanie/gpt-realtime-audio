@@ -1,25 +1,24 @@
 # Azure Speech Assistant
 
-A Gradio conversation using **Azure AI Speech** for speech-to-text (STT) and
-**Azure OpenAI** for automatic generative replies, with on-demand
-**Azure AI Speech** text-to-speech (TTS).
+A Gradio interface using **Azure AI Speech** for speech-to-text (STT) and
+on-demand text-to-speech (TTS), with a shared editable text area.
 
 ## Architecture
 
 ```text
 Browser microphone -> Gradio server -> Azure AI Speech STT endpoint
-Conversation dialog <- recognized text (user message) <-
-Transcript + conversation history -> Azure OpenAI -> assistant message
+Editable text area <- recognized text <-
+Editable text area -> Azure AI Speech TTS endpoint -> Audio player
 ```
 
 Each recorded turn is uploaded to the Python app as a WAV file. The server
 sends it to the configured Speech endpoint, collects all recognized sentences,
-and appends the transcription as a user message in the conversation.
-It then automatically sends the conversation history and `SYSTEM_INSTRUCTIONS.md`
-to the configured Azure OpenAI chat deployment and appends its answer.
-The transcript is shown before the LLM call and remains visible if that call fails.
-Messages are isolated to the current Gradio session. Recognition errors are
-shown in the frontend without adding an empty or partial message.
+and replaces the text area's contents with the transcription.
+You can edit the transcription or type your own text before converting it to audio.
+There is no conversation history or automatic OpenAI response; Azure OpenAI and
+`SYSTEM_INSTRUCTIONS.md` are not used. Text is isolated to the current Gradio
+session. Recognition errors are shown in the frontend without changing the
+existing text or clearing the recording.
 WebRTC and TURN credentials are not required.
 
 Browser recordings are converted to 16 kHz, mono, signed 16-bit PCM before
@@ -34,7 +33,6 @@ back to verify the microphone captured speech and check the language selector.
 - FFmpeg installed with both `ffmpeg` and `ffprobe` on `PATH` for MP3 and
   other non-WAV uploads (included in the Docker image)
 - An Azure AI Speech resource and its endpoint (or region)
-- An Azure OpenAI resource with a chat-capable deployment
 - Azure CLI (`az`) for local Entra ID sign-in, or a managed identity when hosted
 
 ## Setup
@@ -49,9 +47,6 @@ Copy-Item .env.example .env
 
 Edit `.env` and set:
 
-- `AZURE_OPENAI_ENDPOINT` and `AZURE_OPENAI_CHAT_DEPLOYMENT` to the OpenAI
-  resource endpoint and an existing chat deployment name. The name is displayed
-  in the UI; there is no implicit default model.
 - `AZURE_SPEECH_ENDPOINT` to the Speech resource's dedicated endpoint, for example
   `https://your-speech-resource.cognitiveservices.azure.com/`. Do not use an
   Azure OpenAI endpoint. Alternatively, leave it unset and configure
@@ -68,18 +63,15 @@ python app.py
 
 Open <http://127.0.0.1:7860>, select the spoken language, record or upload a WAV
 or MP3 clip. Gradio converts uploads to WAV before transcription.
-Stop recording, then press **Send**. The recognized text appears
-as a user message in **Conversation**, followed automatically by the LLM's reply.
-Once the reply arrives, the audio recorder clears automatically for the next
-message without clearing the conversation. If the request fails, the recording
-is kept.
-Repeat to add another message, or press
-**Clear conversation** to reset the dialog.
+Stop recording, then press **Transcribe audio**. The recognized text appears
+in the editable **Text** area, replacing its previous contents.
+After successful transcription, the audio recorder and previous generated audio
+clear automatically. If the request fails, the recording and existing text are
+kept. Press **Clear** to reset the text, recording, and generated audio.
 
-Use the **Use Speech containers** checkbox to switch between online Azure Speech
-(off, the default) and the configured Speech containers (on). The selection is
-per browser session and applies to both transcription and speech synthesis.
-Switching modes does not change the conversation or the Azure OpenAI service.
+The **Use Speech containers** checkbox currently locks both transcription and
+speech synthesis to the configured Speech containers (on). The underlying Speech
+functions also support online Azure Speech when called with container mode off.
 Configure the container endpoints below before using container mode; missing
 endpoints are reported when the corresponding language or voice is used.
 The former `USE_CONTAINER` environment variable no longer controls the mode.
@@ -91,15 +83,19 @@ it remains open, regardless of the selected Speech mode. The Gradio server calls
 `<container-endpoint>/ready` with a 3-second timeout per container. Green means
 the HTTP request succeeded and the JSON contains `"ready": "ready"`; any other
 status, connection error, invalid response, or missing endpoint is shown in red
-with an explanation in the tooltip. These indicators monitor containers, not online Azure Speech
-or Azure OpenAI.
+with an explanation in the tooltip. These indicators monitor containers, not
+online Azure Speech.
 
-Below the conversation, select a multilingual voice and click **Speak last reply**
-to convert the latest assistant message to audio. **Spoken reply** starts playback
+Below the text area, select a multilingual voice and click **Convert text to speech**
+to convert its current contents to audio, including any edits or manually entered
+text. Empty or whitespace-only text is rejected. **Generated audio** starts playback
 automatically when audio is ready. If your browser blocks autoplay, press Play.
 TTS uses the selected Speech mode, and is never called automatically.
-The audio player clears when a new OpenAI reply
-arrives or the conversation is cleared.
+The audio player clears after a successful transcription or when **Clear** is pressed.
+Long texts are synthesized sequentially in chunks of at most 1,000 characters,
+preferably split at line or word boundaries, to avoid long-request failures in
+Speech containers. The PCM audio is joined in order into a single recording.
+If any chunk fails, the request reports an error instead of returning partial audio.
 
 ## Authentication and permissions
 
@@ -116,7 +112,6 @@ resource-specific custom endpoint, or a Speech resource key for that regional UR
 For local development, sign in with `az login`. In Azure Container Apps, enable
 a system-assigned or user-assigned managed identity and grant it
 **Cognitive Services Speech User** on the Azure AI Speech resource.
-Also grant **Cognitive Services OpenAI User** on the Azure OpenAI resource.
 
 Set `AZURE_CLIENT_ID` only when the app should use a particular user-assigned
 managed identity. Keep resource keys and credentials in environment variables or
@@ -126,9 +121,6 @@ a managed secret store; never commit them to source control.
 
 | Variable | Description | Default |
 |---|---|---|
-| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI resource endpoint | *(required)* |
-| `AZURE_OPENAI_CHAT_DEPLOYMENT` | Existing chat deployment name | *(required)* |
-| `AZURE_OPENAI_API_VERSION` | Azure OpenAI API version | `2025-04-01-preview` |
 | `AZURE_SPEECH_ENDPOINT` | Dedicated Speech endpoint; takes precedence over region | *(unset)* |
 | `AZURE_SPEECH_REGION` | Speech region when endpoint is unset | *(required without endpoint)* |
 | `AZURE_SPEECH_KEY` | Optional Speech resource key; omit to use Entra ID | *(unset)* |

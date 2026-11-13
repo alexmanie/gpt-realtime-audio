@@ -1,4 +1,4 @@
-"""Speech-to-text conversation with automatic Azure OpenAI replies."""
+"""Speech-to-text and text-to-speech with an editable transcript."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import math
 import os
 import threading
 import wave
-from collections.abc import Iterator
 from html import escape
 from pathlib import Path
 from urllib.parse import urlparse
@@ -18,9 +17,8 @@ from urllib.request import urlopen
 import azure.cognitiveservices.speech as speechsdk
 import gradio as gr
 import numpy as np
-from azure.identity import ChainedTokenCredential, AzureCliCredential, DefaultAzureCredential, get_bearer_token_provider
+from azure.identity import ChainedTokenCredential, AzureCliCredential, DefaultAzureCredential
 from dotenv import load_dotenv
-from openai import AzureOpenAI
 from scipy.io import wavfile
 from scipy.signal import resample_poly
 
@@ -28,12 +26,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 STT_SAMPLE_RATE = 16000
-COGNITIVE_SERVICES_SCOPE = "https://cognitiveservices.azure.com/.default"
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
-AZURE_OPENAI_CHAT_DEPLOYMENT = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "")
-AZURE_OPENAI_API_VERSION = os.getenv(
-    "AZURE_OPENAI_API_VERSION", "2025-04-01-preview"
-)
+TTS_MAX_CHUNK_CHARS = 1000
 AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "")
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "")
 AZURE_SPEECH_ENDPOINT = os.getenv("AZURE_SPEECH_ENDPOINT", "").strip()
@@ -48,25 +41,11 @@ LANGUAGES = {
     "Slovenian (Slovenia)": "sl-SI",
     "English (US)": "en-US",
 }
-LANGUAGE_NAMES = {
-    "sl-SI": "Slovenian",
-    "en-US": "English",
-}
 AVAILABLE_VOICES = [
     "de-DE-SeraphinaMultilingualNeural",
     "en-US-AndrewMultilingualNeural",
 ]
 DEFAULT_VOICE = AVAILABLE_VOICES[0]
-
-SYSTEM_INSTRUCTIONS_PATH = Path(__file__).with_name("SYSTEM_INSTRUCTIONS.md")
-try:
-    SYSTEM_INSTRUCTIONS = SYSTEM_INSTRUCTIONS_PATH.read_text(encoding="utf-8").strip()
-except FileNotFoundError:
-    SYSTEM_INSTRUCTIONS = (
-        "You are a helpful, friendly voice assistant. "
-        "Keep responses concise and conversational."
-    )
-
 
 def _speech_config() -> speechsdk.SpeechConfig:
     if not AZURE_SPEECH_ENDPOINT and not AZURE_SPEECH_REGION:
@@ -266,78 +245,34 @@ def _prepare_stt_audio(audio_path: str) -> tuple[bytes, float, str]:
 def send_to_stt(
     audio_path: str | None,
     language: str,
-    history: list[dict[str, str]] | None,
     use_container: bool = False,
-) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+) -> tuple[str, None, None]:
     transcript = transcribe_audio(audio_path or "", language, use_container)
-    updated_history = [
-        *(history or []),
-        {"role": "user", "content": transcript},
-    ]
-    return updated_history, updated_history
+    return transcript, None, None
 
 
-def generate_reply(history: list[dict[str, str]], language: str) -> str:
-    if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_CHAT_DEPLOYMENT:
-        raise gr.Error(
-            "Set AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_CHAT_DEPLOYMENT to a "
-            "chat-capable Azure OpenAI deployment."
-        )
-
-    credential = ChainedTokenCredential(AzureCliCredential(), DefaultAzureCredential())
-    client: AzureOpenAI | None = None
-    try:
-        token_provider = get_bearer_token_provider(
-            credential,
-            COGNITIVE_SERVICES_SCOPE,
-        )
-        client = AzureOpenAI(
-            azure_endpoint=AZURE_OPENAI_ENDPOINT,
-            azure_ad_token_provider=token_provider,
-            api_version=AZURE_OPENAI_API_VERSION,
-        )
-        messages = [
-            {
-                "role": "system",
-                "content": f"{SYSTEM_INSTRUCTIONS}\nRespond in the language "
-                f"{LANGUAGE_NAMES.get(language, language)} ({language}).",
-            },
-            *history,
-        ]
-        result = client.chat.completions.create(
-            model=AZURE_OPENAI_CHAT_DEPLOYMENT,
-            messages=messages,
-        )
-    finally:
-        if client is not None:
-            client.close()
-        credential.close()
-
-    reply = result.choices[0].message.content
-    if not reply or not reply.strip():
-        raise gr.Error("The chat deployment returned an empty response.")
-    return reply.strip()
-
-
-def respond(
-    audio_path: str | None,
-    language: str,
-    history: list[dict[str, str]] | None,
-    use_container: bool = False,
-) -> Iterator[
-    tuple[list[dict[str, str]], list[dict[str, str]], dict[str, str] | None]
-]:
-    dialog, state = send_to_stt(audio_path, language, history, use_container)
-    yield dialog, state, gr.skip()
-    reply = generate_reply(state, language)
-    updated_history = [*state, {"role": "assistant", "content": reply}]
-    yield updated_history, updated_history, None
+def _split_tts_text(text: str) -> list[str]:
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + TTS_MAX_CHUNK_CHARS, len(text))
+        if end < len(text):
+            boundary = text.rfind("\n", start, end)
+            if boundary <= start:
+                boundary = text.rfind(" ", start, end)
+            if boundary > start:
+                end = boundary + 1
+        chunks.append(text[start:end])
+        start = end
+    return chunks
 
 
 def synthesize_speech(
     text: str, voice: str, use_container: bool = False
 ) -> tuple[int, np.ndarray]:
-    
+    if not text or not text.strip():
+        raise gr.Error("Enter or transcribe text before converting it to speech.")
+
     if use_container:
         speech_config = _speech_config_container_tts(voice)
     else:
@@ -351,33 +286,37 @@ def synthesize_speech(
         speech_config=speech_config,
         audio_config=None,
     )
-    result = synthesizer.speak_text_async(text).get()
+    chunks = _split_tts_text(text)
+    audio_parts: list[np.ndarray] = []
+    sample_rate = 24000
+    for index, chunk in enumerate(chunks, start=1):
+        if not chunk.strip():
+            continue
+        result = synthesizer.speak_text_async(chunk).get()
+        if result.reason == speechsdk.ResultReason.Canceled:
+            details = result.cancellation_details
+            message = details.error_details or str(details.reason)
+            raise gr.Error(
+                f"Speech synthesis failed (part {index}/{len(chunks)}): {message}"
+            )
+        if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+            raise gr.Error("Speech synthesis did not return audio.")
 
-    if result.reason == speechsdk.ResultReason.Canceled:
-        details = result.cancellation_details
-        message = details.error_details or str(details.reason)
-        raise gr.Error(f"Speech synthesis failed: {message}")
-    if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
-        raise gr.Error("Speech synthesis did not return audio.")
-
-    with wave.open(io.BytesIO(result.audio_data), "rb") as audio_file:
-        if audio_file.getnchannels() != 1 or audio_file.getsampwidth() != 2:
-            raise gr.Error("Speech synthesis returned an unsupported audio format.")
-        sample_rate = audio_file.getframerate()
-        audio = np.frombuffer(
-            audio_file.readframes(audio_file.getnframes()),
-            dtype=np.int16,
-        ).copy()
-    return sample_rate, audio
-
-
-def speak_last_reply(
-    history: list[dict[str, str]] | None, voice: str, use_container: bool = False
-) -> tuple[int, np.ndarray]:
-    for message in reversed(history or []):
-        if message["role"] == "assistant" and message["content"].strip():
-            return synthesize_speech(message["content"], voice, use_container)
-    raise gr.Error("There is no assistant reply to convert to speech yet.")
+        with wave.open(io.BytesIO(result.audio_data), "rb") as audio_file:
+            if (
+                audio_file.getnchannels() != 1
+                or audio_file.getsampwidth() != 2
+                or audio_file.getframerate() != sample_rate
+            ):
+                raise gr.Error("Speech synthesis returned an unsupported audio format.")
+            audio = np.frombuffer(
+                audio_file.readframes(audio_file.getnframes()),
+                dtype=np.int16,
+            ).copy()
+        if not audio.size:
+            raise gr.Error("Speech synthesis returned empty audio.")
+        audio_parts.append(audio)
+    return sample_rate, np.concatenate(audio_parts)
 
 
 def _container_readiness(endpoint: str) -> tuple[bool, str]:
@@ -427,10 +366,10 @@ def check_container_status() -> str:
 
 
 def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="Speech and OpenAI conversation") as demo:
+    with gr.Blocks(title="Speech to Text and Text to Speech") as demo:
         with gr.Row():
             with gr.Column(scale=1, min_width=420):
-                gr.Markdown("# Speech and OpenAI Conversation")
+                gr.Markdown("# Speech to Text and Text to Speech")
             with gr.Column(scale=2, min_width=320):
                 container_status = gr.HTML(
                     '<div role="status" style="text-align:right">'
@@ -438,12 +377,11 @@ def build_ui() -> gr.Blocks:
                 )
         status_timer = gr.Timer(30)
         gr.Markdown(
-            f"""
-            Record your microphone, stop recording, then click **Send**. 
-            The transcription appears as your message in the conversation.  
-            Azure OpenAI replies automatically using deployment
-            **{AZURE_OPENAI_CHAT_DEPLOYMENT or "(not configured)"}**.  
-            Use **Speak last reply** below the conversation to generate audio.
+            """
+            Record your microphone, stop recording, then click **Transcribe audio**.
+            The transcription replaces the text in the editable text area.
+            Edit it or enter your own text, then click **Convert text to speech**
+            to generate audio.
             """
         )
 
@@ -461,30 +399,31 @@ def build_ui() -> gr.Blocks:
                     sources=["microphone", "upload"],
                     type="filepath",
                     format="wav",
-                    label="Your message",
+                    label="Audio to transcribe",
                 )
                 language_dropdown = gr.Dropdown(
                     choices=[(name, locale) for name, locale in LANGUAGES.items()],
                     value="sl-SI",
                     label="Spoken language",
                 )
-                send_button = gr.Button("Send", variant="primary")
-                clear_button = gr.Button("Clear conversation")
+                send_button = gr.Button("Transcribe audio", variant="primary")
+                clear_button = gr.Button("Clear")
 
             with gr.Column(scale=2):
-                chatbot = gr.Chatbot(
-                    label="Conversation",
-                    height=420,
+                text_area = gr.Textbox(
+                    label="Text",
+                    placeholder="Transcribe audio or enter text to convert to speech.",
+                    lines=16,
+                    interactive=True,
                 )
-                conversation_state = gr.State([])
                 voice_dropdown = gr.Dropdown(
                     choices=AVAILABLE_VOICES,
                     value=DEFAULT_VOICE,
-                    label="Reply voice",
+                    label="Voice",
                 )
-                speak_button = gr.Button("Speak last reply")
+                speak_button = gr.Button("Convert text to speech")
                 audio_output = gr.Audio(
-                    label="Spoken reply", interactive=False, format="wav", autoplay=True
+                    label="Generated audio", interactive=False, format="wav", autoplay=True
                 )
 
         demo.load(
@@ -500,25 +439,21 @@ def build_ui() -> gr.Blocks:
             show_progress="hidden",
         )
         send_button.click(
-            fn=respond,
-            inputs=[audio_input, language_dropdown, conversation_state, use_container],
-            outputs=[chatbot, conversation_state, audio_input],
-            concurrency_id="conversation",
-        ).success(
-            fn=lambda: None,
-            outputs=audio_output,
-            concurrency_id="conversation",
+            fn=send_to_stt,
+            inputs=[audio_input, language_dropdown, use_container],
+            outputs=[text_area, audio_input, audio_output],
+            concurrency_id="speech",
         )
         speak_button.click(
-            fn=speak_last_reply,
-            inputs=[conversation_state, voice_dropdown, use_container],
+            fn=synthesize_speech,
+            inputs=[text_area, voice_dropdown, use_container],
             outputs=audio_output,
-            concurrency_id="conversation",
+            concurrency_id="speech",
         )
         clear_button.click(
-            fn=lambda: ([], [], None, None),
-            outputs=[chatbot, conversation_state, audio_input, audio_output],
-            concurrency_id="conversation",
+            fn=lambda: ("", None, None),
+            outputs=[text_area, audio_input, audio_output],
+            concurrency_id="speech",
         )
 
     return demo
