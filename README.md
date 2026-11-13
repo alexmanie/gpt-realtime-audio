@@ -31,6 +31,8 @@ back to verify the microphone captured speech and check the language selector.
 ## Prerequisites
 
 - Python 3.10+
+- FFmpeg installed with both `ffmpeg` and `ffprobe` on `PATH` for MP3 and
+  other non-WAV uploads (included in the Docker image)
 - An Azure AI Speech resource and its endpoint (or region)
 - An Azure OpenAI resource with a chat-capable deployment
 - Azure CLI (`az`) for local Entra ID sign-in, or a managed identity when hosted
@@ -65,7 +67,8 @@ python app.py
 ```
 
 Open <http://127.0.0.1:7860>, select the spoken language, record or upload a WAV
-clip. Stop recording, then press **Send**. The recognized text appears
+or MP3 clip. Gradio converts uploads to WAV before transcription.
+Stop recording, then press **Send**. The recognized text appears
 as a user message in **Conversation**, followed automatically by the LLM's reply.
 Once the reply arrives, the audio recorder clears automatically for the next
 message without clearing the conversation. If the request fails, the recording
@@ -146,3 +149,6 @@ The included `azure.yaml` targets Azure Container Apps. Configure the environmen
 variables above for the deployed app and grant its managed identity the required
 resource roles. For hosted microphone access, use the HTTPS URL provided by
 Container Apps.
+
+After changing the Dockerfile, rebuild and redeploy the app image so the running
+container includes FFmpeg and `ffprobe`.
