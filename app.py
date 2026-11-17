@@ -268,7 +268,7 @@ def _split_tts_text(text: str) -> list[str]:
 
 
 def synthesize_speech(
-    text: str, voice: str, use_container: bool = False
+    text: str, voice: str, use_container: bool = False, language: str = "sl-SI"
 ) -> tuple[int, np.ndarray]:
     if not text or not text.strip():
         raise gr.Error("Enter or transcribe text before converting it to speech.")
@@ -298,7 +298,7 @@ def synthesize_speech(
             'xmlns:emo="http://www.w3.org/2009/10/emotionml" '
             f'version="1.0" xml:lang="{escape("-".join(voice.split("-")[:2]))}">'
             f'<voice name="{escape(voice, quote=True)}">'
-            f'<lang xml:lang="sl-SI">{escape(chunk)}</lang>'
+            f'<lang xml:lang="{escape(language, quote=True)}">{escape(chunk)}</lang>'
             '</voice></speak>'
         )
         result = synthesizer.speak_ssml_async(ssml).get()
@@ -455,7 +455,7 @@ def build_ui() -> gr.Blocks:
         )
         speak_button.click(
             fn=synthesize_speech,
-            inputs=[text_area, voice_dropdown, use_container],
+            inputs=[text_area, voice_dropdown, use_container, language_dropdown],
             outputs=audio_output,
             concurrency_id="speech",
         )

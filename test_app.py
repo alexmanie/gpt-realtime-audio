@@ -135,6 +135,7 @@ class SpeechToTextTests(unittest.TestCase):
         self.assertTrue(speak.outputs[0].autoplay)
         self.assertEqual(speak.inputs[1].value, app.DEFAULT_VOICE)
         self.assertIs(speak.inputs[2], send.inputs[2])
+        self.assertIs(speak.inputs[3], send.inputs[1])
         self.assertIsInstance(send.inputs[2], gr.Checkbox)
         self.assertIs(send.outputs[2], speak.outputs[0])
 
@@ -207,8 +208,12 @@ class SpeechToTextTests(unittest.TestCase):
             audio.setframerate(24000)
             audio.writeframes(b"\x00\x00")
         for use_container in (False, True):
-            for voice in app.AVAILABLE_VOICES:
-                with self.subTest(use_container=use_container, voice=voice):
+            for voice, language in (
+                (voice, language)
+                for voice in app.AVAILABLE_VOICES
+                for language in app.LANGUAGES.values()
+            ):
+                with self.subTest(use_container=use_container, voice=voice, language=language):
                     result = SimpleNamespace(
                         reason=app.speechsdk.ResultReason.SynthesizingAudioCompleted,
                         audio_data=wav.getvalue(),
@@ -221,7 +226,7 @@ class SpeechToTextTests(unittest.TestCase):
                         patch.object(app.speechsdk, "SpeechSynthesizer", return_value=synthesizer),
                     ):
                         text = 'Hello & <world> "quoted" \'text\''
-                        rate, samples = app.synthesize_speech(text, voice, use_container)
+                        rate, samples = app.synthesize_speech(text, voice, use_container, language)
                     self.assertEqual(rate, 24000)
                     self.assertEqual(samples.tolist(), [0])
                     synthesizer.speak_text_async.assert_not_called()
@@ -235,7 +240,7 @@ class SpeechToTextTests(unittest.TestCase):
                     voice_element = root.find(f"{ns}voice")
                     self.assertEqual(voice_element.attrib["name"], voice)
                     language_element = voice_element.find(f"{ns}lang")
-                    self.assertEqual(language_element.attrib[xml_lang], "sl-SI")
+                    self.assertEqual(language_element.attrib[xml_lang], language)
                     self.assertEqual(language_element.text, text)
                     self.assertEqual(len(language_element), 0)
                     self.assertEqual(online.call_count, int(not use_container))
