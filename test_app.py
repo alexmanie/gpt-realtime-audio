@@ -2,6 +2,7 @@ import io
 import tempfile
 import unittest
 import wave
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -213,16 +214,30 @@ class SpeechToTextTests(unittest.TestCase):
                         audio_data=wav.getvalue(),
                     )
                     synthesizer = Mock()
-                    synthesizer.speak_text_async.return_value.get.return_value = result
+                    synthesizer.speak_ssml_async.return_value.get.return_value = result
                     with (
                         patch.object(app, "_speech_config", return_value=Mock()) as online,
                         patch.object(app, "_speech_config_container_tts", return_value=Mock()) as container,
                         patch.object(app.speechsdk, "SpeechSynthesizer", return_value=synthesizer),
                     ):
-                        rate, samples = app.synthesize_speech("Hello", voice, use_container)
+                        text = 'Hello & <world> "quoted" \'text\''
+                        rate, samples = app.synthesize_speech(text, voice, use_container)
                     self.assertEqual(rate, 24000)
                     self.assertEqual(samples.tolist(), [0])
-                    synthesizer.speak_text_async.assert_called_once_with("Hello")
+                    synthesizer.speak_text_async.assert_not_called()
+                    synthesizer.speak_ssml_async.assert_called_once()
+                    root = ET.fromstring(synthesizer.speak_ssml_async.call_args.args[0])
+                    ns = "{http://www.w3.org/2001/10/synthesis}"
+                    xml_lang = "{http://www.w3.org/XML/1998/namespace}lang"
+                    self.assertEqual(root.tag, f"{ns}speak")
+                    self.assertEqual(root.attrib["version"], "1.0")
+                    self.assertEqual(root.attrib[xml_lang], "-".join(voice.split("-")[:2]))
+                    voice_element = root.find(f"{ns}voice")
+                    self.assertEqual(voice_element.attrib["name"], voice)
+                    language_element = voice_element.find(f"{ns}lang")
+                    self.assertEqual(language_element.attrib[xml_lang], "sl-SI")
+                    self.assertEqual(language_element.text, text)
+                    self.assertEqual(len(language_element), 0)
                     self.assertEqual(online.call_count, int(not use_container))
                     if use_container:
                         container.assert_called_once_with(voice)
@@ -241,7 +256,7 @@ class SpeechToTextTests(unittest.TestCase):
                 self.assertTrue(all(0 < len(chunk) <= 1000 for chunk in chunks))
 
     def test_long_synthesis_joins_pcm_in_order_and_rejects_partial_results(self):
-        text = "Sentence about audio. " * 130
+        text = "Sentence & <text> about audio. " * 130
         chunks = app._split_tts_text(text)
         results = []
         for index in range(len(chunks)):
@@ -266,7 +281,7 @@ class SpeechToTextTests(unittest.TestCase):
                         ),
                     )
                 synthesizer = Mock()
-                synthesizer.speak_text_async.return_value.get.side_effect = responses
+                synthesizer.speak_ssml_async.return_value.get.side_effect = responses
                 with (
                     patch.object(app, "_speech_config_container_tts", return_value=Mock()),
                     patch.object(app.speechsdk, "SpeechSynthesizer", return_value=synthesizer),
@@ -274,7 +289,7 @@ class SpeechToTextTests(unittest.TestCase):
                     if fail:
                         with self.assertRaisesRegex(gr.Error, "part 2/.*Internal server error"):
                             app.synthesize_speech(text, app.DEFAULT_VOICE, True)
-                        self.assertEqual(synthesizer.speak_text_async.call_count, 2)
+                        self.assertEqual(synthesizer.speak_ssml_async.call_count, 2)
                     else:
                         rate, samples = app.synthesize_speech(text, app.DEFAULT_VOICE, True)
                         self.assertEqual(rate, 24000)
@@ -282,7 +297,14 @@ class SpeechToTextTests(unittest.TestCase):
                             samples.tolist(),
                             [value for index in range(len(chunks)) for value in (index, -index)],
                         )
-                        sent = [call.args[0] for call in synthesizer.speak_text_async.call_args_list]
+                        sent = [
+                            ET.fromstring(call.args[0]).find(
+                                "{http://www.w3.org/2001/10/synthesis}voice/"
+                                "{http://www.w3.org/2001/10/synthesis}lang"
+                            ).text
+                            for call in synthesizer.speak_ssml_async.call_args_list
+                        ]
+                        self.assertEqual(sent, chunks)
                         self.assertEqual("".join(sent), text)
                         self.assertTrue(all(len(chunk) <= 1000 for chunk in sent))
 
@@ -296,7 +318,7 @@ class SpeechToTextTests(unittest.TestCase):
                     audio.setframerate(rate)
                     audio.writeframes(frames)
                 synthesizer = Mock()
-                synthesizer.speak_text_async.return_value.get.return_value = SimpleNamespace(
+                synthesizer.speak_ssml_async.return_value.get.return_value = SimpleNamespace(
                     reason=app.speechsdk.ResultReason.SynthesizingAudioCompleted,
                     audio_data=wav.getvalue(),
                 )

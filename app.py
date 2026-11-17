@@ -292,7 +292,16 @@ def synthesize_speech(
     for index, chunk in enumerate(chunks, start=1):
         if not chunk.strip():
             continue
-        result = synthesizer.speak_text_async(chunk).get()
+        ssml = (
+            '<speak xmlns="http://www.w3.org/2001/10/synthesis" '
+            'xmlns:mstts="http://www.w3.org/2001/mstts" '
+            'xmlns:emo="http://www.w3.org/2009/10/emotionml" '
+            f'version="1.0" xml:lang="{escape("-".join(voice.split("-")[:2]))}">'
+            f'<voice name="{escape(voice, quote=True)}">'
+            f'<lang xml:lang="sl-SI">{escape(chunk)}</lang>'
+            '</voice></speak>'
+        )
+        result = synthesizer.speak_ssml_async(ssml).get()
         if result.reason == speechsdk.ResultReason.Canceled:
             details = result.cancellation_details
             message = details.error_details or str(details.reason)

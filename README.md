@@ -91,6 +91,9 @@ to convert its current contents to audio, including any edits or manually entere
 text. Empty or whitespace-only text is rejected. **Generated audio** starts playback
 automatically when audio is ready. If your browser blocks autoplay, press Play.
 TTS uses the selected Speech mode, and is never called automatically.
+Each request uses SSML with the selected voice and a `<lang xml:lang="sl-SI">`
+element to request Slovenian pronunciation, independently of the recognition
+language selector. Text is XML-escaped so special characters remain literal text.
 The audio player clears after a successful transcription or when **Clear** is pressed.
 Long texts are synthesized sequentially in chunks of at most 1,000 characters,
 preferably split at line or word boundaries, to avoid long-request failures in
