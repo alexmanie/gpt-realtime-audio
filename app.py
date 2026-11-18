@@ -399,7 +399,7 @@ def build_ui() -> gr.Blocks:
                 use_container = gr.Checkbox(
                     label="Use Speech containers",
                     value=True,
-                    interactive=False,
+                    interactive=True,
                     info=f"""
                     Off: online Azure Speech.  
                     On: configured Speech containers.""",
